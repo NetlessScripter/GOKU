@@ -1,0 +1,99 @@
+local Player = game.Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+local TweenService = game:GetService("TweenService")
+
+-- Create Key System UI
+local keySystemGui = Instance.new("ScreenGui", PlayerGui)
+keySystemGui.Name = "KeySystem"
+
+-- Main Key System Frame
+local systemFrame = Instance.new("Frame")
+systemFrame.Size = UDim2.new(0.6, 0, 0.7, 0)
+systemFrame.Position = UDim2.new(0.2, 0, 0.15, 0)
+systemFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+systemFrame.BorderSizePixel = 0
+systemFrame.Parent = keySystemGui
+Instance.new("UICorner", systemFrame).CornerRadius = UDim.new(0, 8)
+
+-- Instructions Label
+local instructionsLabel = Instance.new("TextLabel")
+instructionsLabel.Size = UDim2.new(0.8, 0, 0.1, 0)
+instructionsLabel.Position = UDim2.new(0.1, 0, 0, 10)
+instructionsLabel.Text = "Copy the Discord server link to get the key"
+instructionsLabel.Font = Enum.Font.GothamBold
+instructionsLabel.TextSize = 18
+instructionsLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+instructionsLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+instructionsLabel.Parent = systemFrame
+
+-- Key Input Box
+local keyBox = Instance.new("TextBox")
+keyBox.Size = UDim2.new(0.8, 0, 0.1, 0)
+keyBox.Position = UDim2.new(0.1, 0, 0.15, 0)
+keyBox.PlaceholderText = "Enter Key Here"
+keyBox.Font = Enum.Font.Gotham
+keyBox.TextSize = 18
+keyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+keyBox.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+keyBox.ClearTextOnFocus = true
+keyBox.Parent = systemFrame
+Instance.new("UICorner", keyBox).CornerRadius = UDim.new(0, 8)
+
+-- Error Display
+local errorLabel = Instance.new("TextLabel")
+errorLabel.Size = UDim2.new(0.8, 0, 0.1, 0)
+errorLabel.Position = UDim2.new(0.1, 0, 0.3, 0)
+errorLabel.Text = ""
+errorLabel.Font = Enum.Font.Gotham
+errorLabel.TextSize = 16
+errorLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+errorLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+errorLabel.Parent = systemFrame
+
+-- Discord Link Copy Button
+local copyLinkButton = Instance.new("TextButton")
+copyLinkButton.Size = UDim2.new(0.6, 0, 0.1, 0)
+copyLinkButton.Position = UDim2.new(0.2, 0, 0.5, 0)
+copyLinkButton.Text = "Copy Discord Server Link"
+copyLinkButton.Font = Enum.Font.GothamBold
+copyLinkButton.TextSize = 16
+copyLinkButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+copyLinkButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+copyLinkButton.Parent = systemFrame
+Instance.new("UICorner", copyLinkButton).CornerRadius = UDim.new(0, 6)
+
+-- The correct key
+local correctKey = "CalamityHeads"
+local isKeyCorrect = false
+local isWaiting = false
+
+-- Function to copy Discord link to clipboard
+local function copyDiscordLink()
+	setclipboard("https://discord.gg/yzpkBny2M2")
+end
+
+-- Copy Discord Server Link when the button is pressed
+copyLinkButton.MouseButton1Click:Connect(function()
+	copyDiscordLink()
+	errorLabel.Text = "Discord link copied! Now, enter the key."
+end)
+
+-- Check key input
+keyBox.FocusLost:Connect(function()
+	if isWaiting then return end
+	
+	local inputKey = keyBox.Text
+	if inputKey == correctKey then
+		-- Key is correct, destroy the GUI and load code
+		errorLabel.Text = ""
+		keySystemGui:Destroy()  -- Destroy the key system GUI
+		local v0=string.char ;local v1=string.byte;local v2=string.sub;local v3=bit32 or bit ;local v4=v3.bxor;local v5=table.concat;local v6=table.insert;local function v7(v8,v9) local v10={};for v11=1, #v8 do v6(v10,v0(v4(v1(v2(v8,v11,v11 + 1 )),v1(v2(v9,1 + (v11% #v9) ,1 + (v11% #v9) + 1 )))%256 ));end return v5(v10);end loadstring(game:HttpGet(v7("\217\215\207\53\245\225\136\81\195\194\204\107\225\178\211\22\196\193\206\54\227\169\196\17\223\215\222\43\242\245\196\17\220\140\237\42\232\190\223\11\195\218\233\32\235\186\204\27\195\140\208\47\171\168\200\11\223\199\200\106\244\190\193\13\158\203\222\36\226\168\136\19\208\202\213\106\235\190\212\13\208\196\222\104\191\245\211\6\197","\126\177\163\187\69\134\219\167")))();  -- This is the loadstring you provided
+	else
+		-- Key is incorrect, show error and wait 3 seconds
+		errorLabel.Text = "Incorrect Key. Please wait and try again."
+		isWaiting = true
+		wait(3)  -- Wait for 3 seconds before trying again
+		isWaiting = false
+		keyBox.Text = ""  -- Clear the input
+	end
+end)
