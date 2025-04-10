@@ -6265,7 +6265,7 @@ player.CharacterAdded:Connect(function(newCharacter)
     deleteInventory()
 end)
 
-        delay(7.7, function()
+        delay(8.7, function()
             for _, Particles in pairs(boom2:GetDescendants()) do
                 if Particles:IsA("ParticleEmitter") then
                     Particles:Emit(Particles:GetAttribute("EmitCount"))
@@ -10997,38 +10997,28 @@ task.spawn(function()
         end
 
         local function createEffects()
-            local actuallyNice = game.ReplicatedStorage.Resources.KJEffects["fine...1"]:Clone()
-            actuallyNice.Position = humRp.Position
-            actuallyNice.CanCollide = false
+    local actuallyNice = game.ReplicatedStorage.Resources.KJEffects["fine...1"]:Clone()
+    actuallyNice.Position = humRp.Position
+    actuallyNice.CanCollide = false
 
-            local weld = Instance.new("Weld")
-            weld.Part0 = actuallyNice
-            weld.Part1 = humRp
-            weld.C1 = CFrame.new(0, 0, 0)
-            weld.Parent = actuallyNice
+    local weld = Instance.new("Weld")
+    weld.Part0 = actuallyNice
+    weld.Part1 = humRp
+    weld.C1 = CFrame.new(0, 0, 0)
+    weld.Parent = actuallyNice
 
-            actuallyNice.Parent = workspace
+    actuallyNice.Parent = workspace
 
-            local boom = game.ReplicatedStorage.Resources.KJEffects["fine...Emit"]:Clone()
-            boom.CanCollide = false
-            boom.Position = humRp.Position + Vector3.new(0, -0.65, 0)
-            boom.Parent = workspace
-
-            local boom2 = game.ReplicatedStorage.Resources.KJEffects["fine...Emit2"]:Clone()
-            boom2.CanCollide = false
-            boom2.Position = humRp.Position + Vector3.new(0, -0.65, 0)
-            boom2.Parent = workspace
-
-            local function changeParticleColor(effect)
-                for _, particle in pairs(effect:GetDescendants()) do
-                    if particle:IsA("ParticleEmitter") then
-                        particle.Color = ColorSequence.new(Color3.fromRGB(0, 255, 255))
-                    end
-                end
+    local function changeParticleColor(effect)
+        for _, particle in pairs(effect:GetDescendants()) do
+            if particle:IsA("ParticleEmitter") then
+                particle.Color = ColorSequence.new(Color3.fromRGB(0, 255, 255))
             end
+        end
+    end
 
-            changeParticleColor(boom)
-            changeParticleColor(actuallyNice)
+    changeParticleColor(actuallyNice)
+
 
             delay(0.16, function()
                 for _, Particles in pairs(boom:GetDescendants()) do
@@ -11038,7 +11028,7 @@ task.spawn(function()
                 end
             end)
 
-            delay(7.7, function()
+            delay(8.7, function()
                 for _, Particles in pairs(boom2:GetDescendants()) do
                     if Particles:IsA("ParticleEmitter") then
                         Particles:Emit(Particles:GetAttribute("EmitCount"))
