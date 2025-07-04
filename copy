@@ -1,0 +1,192 @@
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+
+local discordLink = "https://discord.gg/EdmHHmEsEb"
+local apiUrl = "https://project-mu-silk-77.vercel.app/api/generate"
+local keySoundId = "rbxassetid://2865228021"
+
+local function sendRequest(url, method, body)
+    local jsonData = HttpService:JSONEncode(body or {})
+    local headers = {["Content-Type"] = "application/json"}
+    local requestFunc
+    local isAdvancedRequest = false
+    if syn and syn.request then
+        requestFunc = syn.request
+        isAdvancedRequest = true
+    elseif http_request then
+        requestFunc = http_request
+        isAdvancedRequest = true
+    elseif http and http.request then
+        requestFunc = http.request
+        isAdvancedRequest = true
+    end
+    local success, response
+    if isAdvancedRequest then
+        local req = {
+            Url = url,
+            Method = method,
+            Headers = headers,
+            Body = jsonData
+        }
+        success, response = pcall(requestFunc, req)
+    else
+        success, response = pcall(function()
+            return HttpService:PostAsync(url, jsonData, Enum.HttpContentType.ApplicationJson)
+        end)
+    end
+    if not success then
+        return false, tostring(response)
+    end
+    if typeof(response) == "table" and response.Body then
+        return true, response.Body
+    else
+        return true, response
+    end
+end
+
+local function applyStroke(obj, thickness, color)
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = thickness
+	stroke.Color = color
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = obj
+end
+
+local function createTextEffect(label)
+	local glow = label:Clone()
+	glow.TextColor3 = Color3.fromRGB(0, 150, 255)
+	glow.TextTransparency = 0.5
+	glow.ZIndex = label.ZIndex - 1
+	glow.Position = UDim2.new(0, 0, 0, 0)
+	glow.Parent = label
+end
+
+local gui = Instance.new("ScreenGui", PlayerGui)
+gui.Name = "SoloLevelingKeyUI"
+gui.ResetOnSpawn = false
+
+local blur = Instance.new("BlurEffect", Lighting)
+blur.Size = 24
+blur.Name = "SoloLevelingBlur"
+
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, 400, 0, 260)
+frame.Position = UDim2.new(0.5, -200, 0.5, -130)
+frame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+frame.BorderSizePixel = 0
+frame.BackgroundTransparency = 0.1
+frame.Name = "KeyFrame"
+
+applyStroke(frame, 2, Color3.fromRGB(0, 170, 255))
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, 0, 0, 40)
+title.BackgroundTransparency = 1
+title.Text = "Key Generator"
+title.TextScaled = true
+title.Font = Enum.Font.GothamBlack
+title.TextColor3 = Color3.fromRGB(0, 200, 255)
+title.ZIndex = 2
+createTextEffect(title)
+
+local infoLabel = Instance.new("TextLabel", frame)
+infoLabel.Size = UDim2.new(0.9, 0, 0, 40)
+infoLabel.Position = UDim2.new(0.05, 0, 0.2, 0)
+infoLabel.BackgroundTransparency = 1
+infoLabel.Text = "Click the button to generate your key."
+infoLabel.TextScaled = true
+infoLabel.Font = Enum.Font.Gotham
+infoLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+infoLabel.TextWrapped = true
+
+local generateBtn = Instance.new("TextButton", frame)
+generateBtn.Size = UDim2.new(0.9, 0, 0, 45)
+generateBtn.Position = UDim2.new(0.05, 0, 0.4, 0)
+generateBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 200)
+generateBtn.TextScaled = true
+generateBtn.Text = "Generate Key"
+generateBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+generateBtn.Font = Enum.Font.GothamBold
+
+applyStroke(generateBtn, 2, Color3.fromRGB(255, 255, 255))
+Instance.new("UICorner", generateBtn).CornerRadius = UDim.new(0, 8)
+
+local resultLabel = Instance.new("TextLabel", frame)
+resultLabel.Size = UDim2.new(0.9, 0, 0, 50)
+resultLabel.Position = UDim2.new(0.05, 0, 0.6, 0)
+resultLabel.BackgroundTransparency = 1
+resultLabel.Text = ""
+resultLabel.TextWrapped = true
+resultLabel.TextScaled = true
+resultLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
+resultLabel.Font = Enum.Font.Gotham
+
+local discordBtn = Instance.new("TextButton", frame)
+discordBtn.Text = "🔗 Discord"
+discordBtn.Size = UDim2.new(0.9, 0, 0, 35)
+discordBtn.Position = UDim2.new(0.05, 0, 0.82, 0)
+discordBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 90)
+discordBtn.TextScaled = true
+discordBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+discordBtn.Font = Enum.Font.GothamMedium
+
+applyStroke(discordBtn, 1.5, Color3.fromRGB(114, 137, 218))
+Instance.new("UICorner", discordBtn).CornerRadius = UDim.new(0, 8)
+
+discordBtn.MouseButton1Click:Connect(function()
+	setclipboard(discordLink)
+end)
+
+generateBtn.MouseButton1Click:Connect(function()
+	generateBtn.Text = "Generating..."
+	resultLabel.Text = ""
+	resultLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+
+	local success, hwid = pcall(gethwid)
+	if not success or not hwid or hwid == "" then
+		resultLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+		resultLabel.Text = "Failed to get HWID."
+		generateBtn.Text = "Generate Key"
+		return
+	end
+
+	local body = { hwid = hwid }
+	local ok, response = sendRequest(apiUrl, "POST", body)
+
+	if not ok then
+		resultLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+		resultLabel.Text = "Request failed: " .. response
+	else
+		local data
+		local parsed = pcall(function() data = HttpService:JSONDecode(response) end)
+		if parsed and data and data.link then
+			resultLabel.Text = ""
+
+			setclipboard(data.link)
+
+			pcall(function()
+				game.StarterGui:SetCore("SendNotification", {
+					Title = "NOTIFICATION",
+					Text = "Key Copied!",
+					Duration = 5
+				})
+			end)
+
+			local sound = Instance.new("Sound")
+			sound.SoundId = keySoundId
+			sound.Volume = 2
+			sound.Parent = workspace
+			sound:Play()
+			game.Debris:AddItem(sound, 5)
+		else
+			resultLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+			resultLabel.Text = "Invalid response."
+		end
+	end
+
+	generateBtn.Text = "Generate Key"
+end)
