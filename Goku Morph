@@ -1,0 +1,71 @@
+local RunService = game:GetService("RunService")
+
+local function morph()
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    char:ScaleTo(1.086)
+
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.Transparency = 1
+            part.CanCollide = false
+            part.CanTouch = false
+            part.CanQuery = false
+        elseif part:IsA("Decal") or part:IsA("Texture") then
+            part.Transparency = 1
+        end
+    end
+
+    local GokuPack = game:GetObjects("rbxassetid://75838975378613")[1]
+    GokuPack.Parent = workspace
+    wait(1)
+
+    local NewCharacter = workspace:WaitForChild("Goku Pack"):WaitForChild("Goku (SSJ3)")
+
+    local root = char:WaitForChild("HumanoidRootPart")
+    for _, v in pairs(NewCharacter:GetChildren()) do
+        if v:IsA("BasePart") then
+            v.CFrame = root.CFrame
+        end
+    end
+
+    for _, v in pairs(NewCharacter:GetChildren()) do
+        if v:IsA("Part") then
+            local targetPart = char:FindFirstChild(v.Name)
+            if targetPart then
+                v.Anchored = false
+                v.Massless = true
+                v.CanCollide = false
+                v.CanTouch = false
+                v.CanQuery = false
+                v.Parent = targetPart
+                local motor = Instance.new("Motor6D")
+                motor.Part0 = targetPart
+                motor.Part1 = v
+                motor.C0 = CFrame.new()
+                motor.C1 = CFrame.new()
+                motor.Name = "MorphMotor_" .. v.Name
+                motor.Parent = targetPart
+            end
+        end
+    end
+
+    RunService.Heartbeat:Connect(function()
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+                part.CanTouch = false
+                part.CanQuery = false
+            end
+        end
+        for _, part in pairs(NewCharacter:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+                part.CanTouch = false
+                part.CanQuery = false
+            end
+        end
+    end)
+end
+morph()
