@@ -1,3 +1,7 @@
+--[[
+The Goku Models Are Parented In Workspace Just Change The Model Path And Your Good!
+]]
+
 local RunService = game:GetService("RunService")
 
 local function morph()
