@@ -407,10 +407,13 @@ local Emitter do
 	
 end
 
-local splashAttachments, rainAttachments do
+local splashAttachments, rainAttachments, splashParticles, rainStraightParticles, rainTopdownParticles do
 	
 	splashAttachments = {}
 	rainAttachments = {}
+	splashParticles = {}
+	rainStraightParticles = {}
+	rainTopdownParticles = {}
 	
 	for i = 1, RAIN_SPLASH_NUM do
 		
@@ -437,6 +440,7 @@ local splashAttachments, rainAttachments do
 		splash.Parent = splashAttachment
 		splashAttachment.Archivable = false
 		table.insert(splashAttachments, splashAttachment)
+		table.insert(splashParticles, splash)
 		
 		-- occluded rain particle generation
 		local rainAttachment = Instance.new("Attachment")
@@ -455,6 +459,8 @@ local splashAttachments, rainAttachments do
 		topdownOccluded.Parent = rainAttachment
 		rainAttachment.Archivable = false
 		table.insert(rainAttachments, rainAttachment)
+		table.insert(rainStraightParticles, straightOccluded)
+		table.insert(rainTopdownParticles, topdownOccluded)
 		
 	end
 	
@@ -658,6 +664,9 @@ local function connectLoop()
 			
 			local splashAttachment = splashAttachments[i]
 			local rainAttachment = rainAttachments[i]
+			local splashParticle = splashParticles[i]
+			local rainStraightParticle = rainStraightParticles[i]
+			local rainTopdownParticle = rainTopdownParticles[i]
 			
 			-- Sample random splash position
 			local x = rand:NextNumber(RAIN_OCCLUDECHECK_OFFSET_XZ_MIN, RAIN_OCCLUDECHECK_OFFSET_XZ_MAX)
@@ -668,7 +677,7 @@ local function connectLoop()
 				
 				-- Draw a splash at hit
 				splashAttachment.Position = position + normal * RAIN_SPLASH_CORRECTION_Y
-				splashAttachment.RainSplash:Emit(1)
+				splashParticle:Emit(1)
 				
 				if inside then
 					
@@ -678,8 +687,8 @@ local function connectLoop()
 						corrected = corrected + rainDirection * (currentCeiling - corrected.Y) / rainDirection.Y
 					end
 					rainAttachment.CFrame = transform - transform.p + corrected
-					rainAttachment.RainStraight:Emit(intensityOccludedRain)
-					rainAttachment.RainTopDown:Emit(intensityOccludedRain)
+					rainStraightParticle:Emit(intensityOccludedRain)
+					rainTopdownParticle:Emit(intensityOccludedRain)
 					
 				end
 				
@@ -691,8 +700,8 @@ local function connectLoop()
 					corrected = corrected + rainDirection * (currentCeiling - corrected.Y) / rainDirection.Y
 				end
 				rainAttachment.CFrame = transform - transform.p + corrected
-				rainAttachment.RainStraight:Emit(intensityOccludedRain)
-				rainAttachment.RainTopDown:Emit(intensityOccludedRain)
+				rainStraightParticle:Emit(intensityOccludedRain)
+				rainTopdownParticle:Emit(intensityOccludedRain)
 				
 			end
 			
