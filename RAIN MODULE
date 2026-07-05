@@ -407,6 +407,20 @@ local Emitter do
 	
 end
 
+-- FIX: safe-access helper. Some games (anti-exploit cleanup, weather resets, Terrain
+-- streaming) will silently Destroy() instances this module parents into workspace.Terrain
+-- or workspace.CurrentCamera. Indexing a missing child directly (e.g. v.RainStraight)
+-- throws "X is not a valid member of Y" every single frame, which is what was flooding
+-- the Output window and tanking framerate. child() returns the real instance when it
+-- exists, or a silent no-op sink when it doesn't, so property writes never error.
+local DUMMY_SINK = setmetatable({}, {
+	__newindex = function() end,
+	__index = function() return nil end,
+})
+local function child(inst, name)
+	return (inst and inst:FindFirstChild(name)) or DUMMY_SINK
+end
+
 local splashAttachments, rainAttachments, splashParticles, rainStraightParticles, rainTopdownParticles do
 	
 	splashAttachments = {}
@@ -445,13 +459,13 @@ local splashAttachments, rainAttachments, splashParticles, rainStraightParticles
 		-- occluded rain particle generation
 		local rainAttachment = Instance.new("Attachment")
 		rainAttachment.Name = "__RainOccludedAttachment"
-		local straightOccluded = Emitter.RainStraight:Clone()
+		local straightOccluded = child(Emitter,"RainStraight"):Clone()
 		straightOccluded.Speed = NumberRange.new(RAIN_OCCLUDED_MINSPEED, RAIN_OCCLUDED_MAXSPEED)
 		straightOccluded.SpreadAngle = RAIN_OCCLUDED_SPREAD
 		straightOccluded.LockedToPart = false
 		straightOccluded.Enabled = false
 		straightOccluded.Parent = rainAttachment
-		local topdownOccluded = Emitter.RainTopDown:Clone()
+		local topdownOccluded = child(Emitter,"RainTopDown"):Clone()
 		topdownOccluded.Speed = NumberRange.new(RAIN_OCCLUDED_MINSPEED, RAIN_OCCLUDED_MAXSPEED)
 		topdownOccluded.SpreadAngle = RAIN_OCCLUDED_SPREAD
 		topdownOccluded.LockedToPart = false
@@ -543,8 +557,8 @@ local function connectLoop()
 				+ (1 - t) * workspace.CurrentCamera.CFrame.lookVector * Emitter.Size.Z/3
 				- t * rainDirection * RAIN_EMITTER_UP_MODIFIER
 			
-			Emitter.RainStraight.Enabled = true
-			Emitter.RainTopDown.Enabled = true
+			child(Emitter,"RainStraight").Enabled = true
+			child(Emitter,"RainTopDown").Enabled = true
 			
 			inside = false
 			
@@ -552,8 +566,8 @@ local function connectLoop()
 			
 			-- Camera is inside / above ceiling
 			
-			Emitter.RainStraight.Enabled = false
-			Emitter.RainTopDown.Enabled = false
+			child(Emitter,"RainStraight").Enabled = false
+			child(Emitter,"RainTopDown").Enabled = false
 		
 			inside = true
 			
@@ -595,9 +609,9 @@ local function connectLoop()
 				
 				-- Update emitter properties
 				for _,v in pairs(rainAttachments) do
-					v.RainStraight.Transparency = straightSequence
-					v.RainStraight.Rotation = straightRotation
-					v.RainTopDown.Transparency = topdownSequence
+					child(v,"RainStraight").Transparency = straightSequence
+					child(v,"RainStraight").Rotation = straightRotation
+					child(v,"RainTopDown").Transparency = topdownSequence
 				end
 				
 				if not disabled then
@@ -636,9 +650,9 @@ local function connectLoop()
 			else
 				
 				-- Update emitter properties
-				Emitter.RainStraight.Transparency = straightSequence
-				Emitter.RainStraight.Rotation = straightRotation
-				Emitter.RainTopDown.Transparency = topdownSequence
+				child(Emitter,"RainStraight").Transparency = straightSequence
+				child(Emitter,"RainStraight").Rotation = straightRotation
+				child(Emitter,"RainTopDown").Transparency = topdownSequence
 				
 			end
 			
@@ -741,8 +755,8 @@ local function disable()
 	disconnectLoop()
 	
 	-- Hide Emitter
-	Emitter.RainStraight.Enabled = false
-	Emitter.RainTopDown.Enabled = false
+	child(Emitter,"RainStraight").Enabled = false
+	child(Emitter,"RainTopDown").Enabled = false
 	Emitter.Size = MIN_SIZE
 	
 	-- Disable sound now if not tweened into disabled state beforehand
@@ -767,15 +781,15 @@ local Color = makeProperty("Color3Value", RAIN_DEFAULT_COLOR, function(value)
 	
 	local value = ColorSequence.new(value)
 	
-	Emitter.RainStraight.Color = value
-	Emitter.RainTopDown.Color = value
+	child(Emitter,"RainStraight").Color = value
+	child(Emitter,"RainTopDown").Color = value
 	
 	for _,v in pairs(splashAttachments) do
-		v.RainSplash.Color = value
+		child(v,"RainSplash").Color = value
 	end
 	for _,v in pairs(rainAttachments) do
-		v.RainStraight.Color = value
-		v.RainTopDown.Color = value
+		child(v,"RainStraight").Color = value
+		child(v,"RainTopDown").Color = value
 	end
 	
 end)
@@ -796,7 +810,7 @@ local function updateTransparency(value)
 	}
 	
 	for _,v in pairs(splashAttachments) do
-		v.RainSplash.Transparency = splashSequence
+		child(v,"RainSplash").Transparency = splashSequence
 	end
 	
 end
@@ -805,15 +819,15 @@ GlobalModifier.Changed:connect(updateTransparency)
 
 local SpeedRatio = makeProperty("NumberValue", RAIN_DEFAULT_SPEEDRATIO, function(value)
 	
-	Emitter.RainStraight.Speed = NumberRange.new(value * RAIN_STRAIGHT_MAX_SPEED)
-	Emitter.RainTopDown.Speed = NumberRange.new(value * RAIN_TOPDOWN_MAX_SPEED)
+	child(Emitter,"RainStraight").Speed = NumberRange.new(value * RAIN_STRAIGHT_MAX_SPEED)
+	child(Emitter,"RainTopDown").Speed = NumberRange.new(value * RAIN_TOPDOWN_MAX_SPEED)
 	
 end)
 
 local IntensityRatio = makeProperty("NumberValue", RAIN_DEFAULT_INTENSITYRATIO, function(value)
 	
-	Emitter.RainStraight.Rate = RAIN_STRAIGHT_MAX_RATE * value
-	Emitter.RainTopDown.Rate = RAIN_TOPDOWN_MAX_RATE * value
+	child(Emitter,"RainStraight").Rate = RAIN_STRAIGHT_MAX_RATE * value
+	child(Emitter,"RainTopDown").Rate = RAIN_TOPDOWN_MAX_RATE * value
 	
 	intensityOccludedRain = math.ceil(RAIN_OCCLUDED_MAXINTENSITY * value)
 	numSplashes = RAIN_SPLASH_NUM * value
@@ -822,30 +836,30 @@ end)
 
 local LightEmission = makeProperty("NumberValue", RAIN_DEFAULT_LIGHTEMISSION, function(value)
 	
-	Emitter.RainStraight.LightEmission = value
-	Emitter.RainTopDown.LightEmission = value
+	child(Emitter,"RainStraight").LightEmission = value
+	child(Emitter,"RainTopDown").LightEmission = value
 	
 	for _,v in pairs(rainAttachments) do
-		v.RainStraight.LightEmission = value
-		v.RainTopDown.LightEmission = value
+		child(v,"RainStraight").LightEmission = value
+		child(v,"RainTopDown").LightEmission = value
 	end
 	for _,v in pairs(splashAttachments) do
-		v.RainSplash.LightEmission = value
+		child(v,"RainSplash").LightEmission = value
 	end
 	
 end)
 
 local LightInfluence = makeProperty("NumberValue", RAIN_DEFAULT_LIGHTINFLUENCE, function(value)
 	
-	Emitter.RainStraight.LightInfluence = value
-	Emitter.RainTopDown.LightInfluence = value
+	child(Emitter,"RainStraight").LightInfluence = value
+	child(Emitter,"RainTopDown").LightInfluence = value
 	
 	for _,v in pairs(rainAttachments) do
-		v.RainStraight.LightInfluence = value
-		v.RainTopDown.LightInfluence = value
+		child(v,"RainStraight").LightInfluence = value
+		child(v,"RainTopDown").LightInfluence = value
 	end
 	for _,v in pairs(splashAttachments) do
-		v.RainSplash.LightInfluence = value
+		child(v,"RainSplash").LightInfluence = value
 	end
 	
 end)
@@ -871,8 +885,8 @@ function Rain:Enable(tweenInfo)
 	
 	disconnectLoop() -- Just in case :Enable(..) is called multiple times on accident
 	
-	Emitter.RainStraight.Enabled = true
-	Emitter.RainTopDown.Enabled = true
+	child(Emitter,"RainStraight").Enabled = true
+	child(Emitter,"RainTopDown").Enabled = true
 	Emitter.Parent = workspace.CurrentCamera
 	
 	for i = 1, RAIN_SPLASH_NUM do
@@ -1024,10 +1038,10 @@ function Rain:SetStraightTexture(asset)
 		error("bad argument #1 to 'SetStraightTexture' (string expected, got " .. typeof(asset) .. ")", 2)
 	end
 	
-	Emitter.RainStraight.Texture = asset
+	child(Emitter,"RainStraight").Texture = asset
 	
 	for _,v in pairs(rainAttachments) do
-		v.RainStraight.Texture = asset
+		child(v,"RainStraight").Texture = asset
 	end
 	
 end
@@ -1038,10 +1052,10 @@ function Rain:SetTopDownTexture(asset)
 		error("bad argument #1 to 'SetStraightTexture' (string expected, got " .. typeof(asset) .. ")", 2)
 	end
 	
-	Emitter.RainTopDown.Texture = asset
+	child(Emitter,"RainTopDown").Texture = asset
 	
 	for _,v in pairs(rainAttachments) do
-		v.RainTopDown.Texture = asset
+		child(v,"RainTopDown").Texture = asset
 	end
 	
 end
@@ -1053,7 +1067,7 @@ function Rain:SetSplashTexture(asset)
 	end
 	
 	for _,v in pairs(splashAttachments) do
-		v.RainSplash.Texture = asset
+		child(v,"RainSplash").Texture = asset
 	end
 	
 end
