@@ -26,6 +26,11 @@
 	--WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING--
 --]=]
 
+-- Already loaded? Hand back the existing API instead of stacking a second rain system
+if getgenv().RainAPI then
+	return getgenv().RainAPI
+end
+
 -- Feel free to modify these settings
 
 local Settings = {
@@ -333,18 +338,45 @@ function ScreenRain:Configure(settings)
 	end
 end
 
--- Start it up right away since this is now a standalone LocalScript
-ScreenRain:Enable()
-if getgenv().Rain ~= true then getgenv().Rain = true 
-pcall(function()
-local module = {}
+-- Public API: loadstring(...)() returns it, and it is also stored in getgenv().RainAPI
+local RAIN_FADE_IN = 5 -- seconds, same fade the script always used on start
+local RAIN_FADE_OUT = 2 -- seconds
 
-function module:Rain()
-	if not _G.Raining then
-		_G.Raining = true
+local RainAPI = {}
+local rainEnabled = false
+local rainHooks = {} -- filled in by the weather section below
+
+function RainAPI:Enable(fadeTime)
+	if rainEnabled then
+		return
+	end
+	rainEnabled = true
+	_G.Raining = true
+	ScreenRain:Enable()
+	if rainHooks.Enable then
+		rainHooks.Enable(fadeTime or RAIN_FADE_IN)
 	end
 end
 
+function RainAPI:Disable(fadeTime)
+	if not rainEnabled then
+		return
+	end
+	rainEnabled = false
+	_G.Raining = false
+	ScreenRain:Disable()
+	if rainHooks.Disable then
+		rainHooks.Disable(fadeTime or RAIN_FADE_OUT)
+	end
+end
+
+function RainAPI:IsEnabled()
+	return rainEnabled
+end
+
+getgenv().RainAPI = RainAPI
+getgenv().Rain = true
+pcall(function()
 
 s=Instance.new'Sound';
 s.Parent=game.CoreGui;
@@ -353,6 +385,7 @@ s.Pitch=1;
 s.Volume=.3;
 s.Looped=true;
 s:play();
+local ambientSound1 = s
 
 wait(0.1)
 
@@ -364,6 +397,7 @@ s.Pitch=1.3;
 s.Volume=.8;
 s.Looped=true;
 s:play();
+local ambientSound2 = s
 
 
 wait(0.1)
@@ -1490,8 +1524,37 @@ function Rain:SetCollisionMode(mode, param)
 	
 end
 
-module:Rain()
-Rain:Enable(TweenInfo.new(5))
+local ambientSounds = {
+	{ sound = ambientSound1, volume = ambientSound1.Volume },
+	{ sound = ambientSound2, volume = ambientSound2.Volume },
+}
+
+rainHooks.Enable = function(fadeTime)
+	Rain:Enable(TweenInfo.new(fadeTime))
+	for _, ambient in ipairs(ambientSounds) do
+		if not ambient.sound.Playing then
+			ambient.sound.Volume = 0
+			ambient.sound:Play()
+		end
+		TweenService:Create(ambient.sound, TweenInfo.new(fadeTime), { Volume = ambient.volume }):Play()
+	end
+end
+
+rainHooks.Disable = function(fadeTime)
+	Rain:Disable(TweenInfo.new(fadeTime))
+	for _, ambient in ipairs(ambientSounds) do
+		local fade = TweenService:Create(ambient.sound, TweenInfo.new(fadeTime), { Volume = 0 })
+		fade.Completed:Connect(function(state)
+			if state == Enum.PlaybackState.Completed then
+				ambient.sound:Stop()
+			end
+		end)
+		fade:Play()
+	end
+end
 
 end)
-else end
+
+RainAPI:Enable()
+
+return RainAPI
