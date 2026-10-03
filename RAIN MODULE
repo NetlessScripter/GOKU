@@ -354,7 +354,10 @@ function RainAPI:Enable(fadeTime)
 	_G.Raining = true
 	ScreenRain:Enable()
 	if rainHooks.Enable then
-		rainHooks.Enable(fadeTime or RAIN_FADE_IN)
+		local hookOk, hookError = pcall(rainHooks.Enable, fadeTime or RAIN_FADE_IN)
+		if not hookOk then
+			warn("[Rain] the rain itself failed to start: " .. tostring(hookError))
+		end
 	end
 end
 
@@ -1256,17 +1259,35 @@ function Rain:Enable(tweenInfo)
 	
 	disconnectLoop() -- Just in case :Enable(..) is called multiple times on accident
 	
+	-- Parent safely: if anything was destroyed while the rain was off, the raw
+	-- assignment throws and used to abort the whole Enable, leaving only the
+	-- screen droplets. Now a failure is reported once and the rest still runs.
+	local parentFailures, firstParentError = 0, nil
+	local function safeParent(inst, parent)
+		local ok, err = pcall(function()
+			inst.Parent = parent
+		end)
+		if not ok then
+			parentFailures += 1
+			firstParentError = firstParentError or (tostring(inst.Name) .. ": " .. tostring(err))
+		end
+	end
+	
 	child(Emitter,"RainStraight").Enabled = true
 	child(Emitter,"RainTopDown").Enabled = true
-	Emitter.Parent = workspace.CurrentCamera
+	safeParent(Emitter, workspace.CurrentCamera)
 	
 	for i = 1, RAIN_SPLASH_NUM do
-		splashAttachments[i].Parent = workspace.Terrain
-		rainAttachments[i].Parent = workspace.Terrain
+		safeParent(splashAttachments[i], workspace.Terrain)
+		safeParent(rainAttachments[i], workspace.Terrain)
 	end
 	
 	if RunService:IsRunning() then -- don't need sound in studio preview, it won't work anyway
-		SoundGroup.Parent = game:GetService("SoundService")
+		safeParent(SoundGroup, game:GetService("SoundService"))
+	end
+	
+	if parentFailures > 0 then
+		warn("[Rain] " .. parentFailures .. " rain object(s) couldn't be re-parented (first: " .. tostring(firstParentError) .. ")")
 	end
 	
 	connectLoop()
