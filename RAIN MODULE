@@ -1,1581 +1,1487 @@
---[=[
-
-	--Copyright boatbomber 2022--
-
-	--Given under a MPL 2.0 License--
-		Explanation of license: https://tldrlegal.com/license/mozilla-public-license-2.0-(mpl-2)
-
-	--FEATURES--
-
-	Creates droplets of "water" on the screen, with a distortion effect, giving great immersion
-	for games that have rainy environments.
-
-	Droplets will not spawn if the player is indoors or under cover of some sort.
-	Droplets will not spawn if the camera is pointed down, as that is avoiding "getting rain in the eyes".
-
-	--WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING--
-
-	THIS PRODUCT RELIES ON GLASS MATERIAL, THUS SHARING ALL THE LIMITATIONS OF GLASS.
-
-	Non-opaque objects are currently not visible through glass.
-	This includes, but is not limited to, transparent parts, decals on transparent
-	parts, particles, and world-space gui objects.
-	Additionally, it only looks right for users with graphic settings of at least 8.
-	Hence, I've set it to only spawn droplets if the user has the graphics set high enough.
-
-	--WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING-- --WARNING--
---]=]
-
--- Already loaded? Hand back the existing API instead of stacking a second rain system
-if getgenv().RainAPI then
-	return getgenv().RainAPI
-end
-
--- Feel free to modify these settings
+if _G.Rain == nil then _G.Rain = true end
 
 local Settings = {
-	-- How many droplets spawn per second
 	Rate = 5,
-
-	-- How large the droplets roughly are (in studs)
 	Size = 0.08,
-
-	-- What color the droplets are tinted (leave as nil for a default realistic light blue)
 	Tint = Color3.fromRGB(226, 244, 255),
-
-	-- How long it takes for a droplet to fade
 	Fade = 1.5,
-
-	-- Update frequency
 	UpdateFreq = 1 / 45,
 }
 
--------------------------------------------------------------------------------------------------------
--- Modifications beyond this point may alter/break functionality if you don't know what you're doing --
--------------------------------------------------------------------------------------------------------
-
--- Services
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local Player = Players.LocalPlayer
+local GameSettings = UserSettings().GameSettings
 
-local DISTANT_CF = CFrame.new(0, 0, 1_000_000)
-
--- Simple object pool to avoid constantly creating new objects
-local ObjectPool = {}
-
-function ObjectPool.new(Object: Instance, InitialAmount: number?)
-	local Pool = {
-		Object = Object:Clone(),
-		Available = {},
-	}
-
-	for i = 1, InitialAmount or 1 do
-		Pool.Available[i] = Pool.Object:Clone()
-	end
-
-	function Pool:Get()
-		local i = #Pool.Available
-		local obj = Pool.Available[i]
-		if obj then
-			table.remove(Pool.Available, i)
-			return obj
-		else
-			return Pool.Object:Clone()
-		end
-	end
-
-	function Pool:Return(obj: BasePart)
-		obj.CFrame = DISTANT_CF
-		table.insert(Pool.Available, obj)
-	end
-
-	return Pool
+local Camera = workspace.CurrentCamera
+while not Camera do
+	RunService.Heartbeat:Wait()
+	Camera = workspace.CurrentCamera
 end
 
--- Constants
 local UP_VEC = Vector3.new(0, 1, 0)
 local UNIT_VEC = Vector3.new(1, 1, 1)
 local EMPTY_VEC = Vector3.new(0, 0, 0)
+local DISTANT_CF = CFrame.new(0, 0, 1000000)
 
---Player related
-local Camera = workspace.CurrentCamera
-local Player = Players.LocalPlayer
-local GameSettings = UserSettings().GameSettings
-local GlassGraphics = GameSettings.SavedQualityLevel.Value >= 8
+local function qualityAllowsGlass()
+	local quality = GameSettings.SavedQualityLevel.Value
+	return quality >= 8 or quality == 0
+end
+
+local GlassGraphics = qualityAllowsGlass()
 GameSettings:GetPropertyChangedSignal("SavedQualityLevel"):Connect(function()
-	GlassGraphics = GameSettings.SavedQualityLevel.Value >= 8 or GameSettings.SavedQualityLevel.Value == 0
+	GlassGraphics = qualityAllowsGlass()
 end)
 
---Settings defaulted
-Settings.Rate = Settings.Rate or 5
-Settings.Size = Settings.Size or 1.5
-Settings.Tint = Settings.Tint or Color3.fromRGB(226, 244, 255)
-Settings.Fade = Settings.Fade or 1.5
-Settings.UpdateFreq = Settings.UpdateFreq or (1 / 45)
+local IgnoredInstances = {}
 
---Raycasting
-local ignoreList, ignoreLength = {}, 0
-
-local function addToIgnore(obj: Instance?)
-	if obj then
-		local index = ignoreLength + 1
-		ignoreLength += 1
-		ignoreList[index] = obj
-
-		local connection
-		connection = obj.AncestryChanged:Connect(function()
-			if obj:IsDescendantOf(game) then
-				return
-			end
-			connection:Disconnect()
-
-			-- Perform a fast unordered table removal
-			ignoreList[index] = ignoreList[ignoreLength]
-			ignoreList[ignoreLength] = nil
-			ignoreLength -= 1
-		end)
+local function addToIgnore(instance)
+	if not instance or IgnoredInstances[instance] then
+		return
 	end
+
+	IgnoredInstances[instance] = true
+	instance.AncestryChanged:Connect(function()
+		if not instance:IsDescendantOf(game) then
+			IgnoredInstances[instance] = nil
+		end
+	end)
+end
+
+local function getIgnoreList()
+	local list = {}
+	for instance in pairs(IgnoredInstances) do
+		if instance:IsDescendantOf(game) then
+			table.insert(list, instance)
+		else
+			IgnoredInstances[instance] = nil
+		end
+	end
+	return list
 end
 
 addToIgnore(Player.Character)
 Player.CharacterAdded:Connect(addToIgnore)
 
---Droplet holder
 local ScreenDroplets = Instance.new("Folder")
 ScreenDroplets.Name = "ScreenDroplets"
 ScreenDroplets.Parent = Camera
 addToIgnore(ScreenDroplets)
 
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	local newCamera = workspace.CurrentCamera
+	if newCamera then
+		Camera = newCamera
+		ScreenDroplets.Parent = Camera
+	end
+end)
+
 local Animations = {}
 local Offsets = {}
 local CameraCF = Camera.CFrame
+local screenRainEnabled = _G.Rain ~= false
 
--- Keep objects in front of camera
-local dropletCount = (Settings.Rate * Settings.Fade) * 3
 RunService:BindToRenderStep("ScreenRainUpdate", Enum.RenderPriority.Camera.Value + 1, function()
+	Camera = workspace.CurrentCamera or Camera
 	CameraCF = Camera.CFrame
 
-	local droplets = table.create(dropletCount)
-	local dropletCF = table.create(dropletCount)
-
-	local i = 0
+	local droplets = {}
+	local dropletCFrames = {}
 	for droplet, offset in pairs(Offsets) do
-		i += 1
-		dropletCF[i] = CameraCF * offset
-		droplets[i] = droplet
+		if droplet.Parent then
+			table.insert(droplets, droplet)
+			table.insert(dropletCFrames, CameraCF * offset)
+		else
+			Offsets[droplet] = nil
+			Animations[droplet] = nil
+		end
 	end
-	dropletCount = i
 
-	workspace:BulkMoveTo(droplets, dropletCF, Enum.BulkMoveMode.FireCFrameChanged)
+	if #droplets > 0 then
+		workspace:BulkMoveTo(droplets, dropletCFrames, Enum.BulkMoveMode.FireCFrameChanged)
+	end
 end)
 
-local DropletPool = nil
-do
-	-- Droplet prefab
-	local DropletPrefab = Instance.new("Part")
-	DropletPrefab.Name = "Droplet"
-	DropletPrefab.Material = Enum.Material.Glass
-	DropletPrefab.CastShadow = false
-	DropletPrefab.CanCollide = false
-	DropletPrefab.CanQuery = false
-	DropletPrefab.CanTouch = false
-	DropletPrefab.Anchored = true
-	DropletPrefab.Transparency = 0.5
-	DropletPrefab.Color = Settings.Tint
-	DropletPrefab.Size = UNIT_VEC
+local function createObjectPool(object, initialAmount)
+	local pool = {
+		Template = object:Clone(),
+		Available = {},
+	}
 
-	local MeshPrefab = Instance.new("SpecialMesh")
-	MeshPrefab.Name = "Mesh"
-	MeshPrefab.MeshType = Enum.MeshType.Sphere
-	MeshPrefab.Parent = DropletPrefab
+	for _ = 1, math.max(1, math.floor(initialAmount)) do
+		table.insert(pool.Available, pool.Template:Clone())
+	end
 
-	DropletPool = ObjectPool.new(DropletPrefab, (Settings.Rate * Settings.Fade) * 3)
+	function pool:Get()
+		local objectIndex = #self.Available
+		local pooledObject = self.Available[objectIndex]
+		if pooledObject then
+			table.remove(self.Available, objectIndex)
+			return pooledObject
+		end
+		return self.Template:Clone()
+	end
+
+	function pool:Return(objectToReturn)
+		objectToReturn.CFrame = DISTANT_CF
+		table.insert(self.Available, objectToReturn)
+	end
+
+	return pool
 end
 
-local function Cleanup(obj: Instance)
-	Animations[obj] = nil
-	Offsets[obj] = nil
-	DropletPool:Return(obj)
+local DropletPrefab = Instance.new("Part")
+DropletPrefab.Name = "Droplet"
+DropletPrefab.Material = Enum.Material.Glass
+DropletPrefab.CastShadow = false
+DropletPrefab.CanCollide = false
+DropletPrefab.CanQuery = false
+DropletPrefab.CanTouch = false
+DropletPrefab.Anchored = true
+DropletPrefab.Transparency = 0.5
+DropletPrefab.Color = Settings.Tint
+DropletPrefab.Size = UNIT_VEC
+
+local MeshPrefab = Instance.new("SpecialMesh")
+MeshPrefab.Name = "Mesh"
+MeshPrefab.MeshType = Enum.MeshType.Sphere
+MeshPrefab.Parent = DropletPrefab
+
+local DropletPool = createObjectPool(DropletPrefab, (Settings.Rate * Settings.Fade) * 3)
+DropletPrefab:Destroy()
+
+local function cleanup(object)
+	Animations[object] = nil
+	Offsets[object] = nil
+	DropletPool:Return(object)
 end
 
---Returns whether the given position is under cover
-local function UnderObject(pos, len)
-	len = len or 120
-
-	local hit, position = workspace:FindPartOnRayWithIgnoreList(Ray.new(pos, UP_VEC * len), ignoreList)
-	if hit then
-		return hit.Transparency ~= 1 and true or UnderObject(position + UP_VEC, len - (pos - position).Magnitude)
-	else
-		return false
+local function setScreenRainEnabled(enabled)
+	screenRainEnabled = enabled == true
+	if not screenRainEnabled then
+		local activeDroplets = {}
+		for droplet in pairs(Animations) do
+			table.insert(activeDroplets, droplet)
+		end
+		for _, droplet in ipairs(activeDroplets) do
+			cleanup(droplet)
+		end
 	end
 end
 
---Creates a random droplet on screen
-local function CreateDroplet()
-	local Scale = Settings.Size + (math.random((Settings.Size / 3) * -10, (Settings.Size / 3) * 10) / 10)
+local function underObject(position, length)
+	local remaining = length or 120
+	local origin = position
+	local ignoreList = getIgnoreList()
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = ignoreList
+	raycastParams.IgnoreWater = true
 
-	local DropletMain = DropletPool:Get()
-	DropletMain.Mesh.Scale = Vector3.new(Scale, Scale, Scale)
-	DropletMain.Mesh.Offset = EMPTY_VEC
-	DropletMain.Color = Settings.Tint
-	DropletMain.Transparency = 0.7
+	for _ = 1, 32 do
+		local result = workspace:Raycast(origin, UP_VEC * remaining, raycastParams)
+		if not result then
+			return false
+		end
 
-	local DropletOffset = CFrame.new(math.random(-120, 120) / 100, math.random(-100, 100) / 100, -1)
-	Offsets[DropletMain] = DropletOffset
+		local hit = result.Instance
+		if not hit:IsA("BasePart") or hit.Transparency < 1 then
+			return true
+		end
 
-	Animations[DropletMain] = {
-		startClock = os.clock(),
-		scale = Scale,
-		stretch = (math.random(5, 10) / 10) * Scale,
-		mesh = DropletMain.Mesh,
-	}
+		table.insert(ignoreList, hit)
+		raycastParams.FilterDescendantsInstances = ignoreList
+		remaining -= (result.Position - origin).Magnitude + 0.01
+		if remaining <= 0 then
+			return false
+		end
+		origin = result.Position + UP_VEC * 0.01
+	end
 
-	DropletMain.Parent = ScreenDroplets
+	return false
+end
 
-	--Create droplet extrusions
-	for _ = 1, math.random(4) do
-		local ExtrusionScale = (Scale / 1.5) + (math.random((Scale / 3) * -100, (Scale / 3) * 100) / 100)
+local function createDroplet()
+	local scale = Settings.Size * (0.8 + math.random() * 0.4)
+	local mainOffset = CFrame.new(math.random() * 2.4 - 1.2, math.random() * 2 - 1, -1)
 
-		local Extrusion = DropletPool:Get()
-		Extrusion.Mesh.Scale = Vector3.new(ExtrusionScale, ExtrusionScale, ExtrusionScale)
-		Extrusion.Mesh.Offset = EMPTY_VEC
-		Extrusion.Color = Settings.Tint
-		Extrusion.Transparency = 0.7
-
-		local e2 = ExtrusionScale * 60
-		local ExtrusionOffset = DropletOffset * CFrame.new(math.random(-e2, e2) / 100, math.random(-e2, e2) / 100, 0)
-		Offsets[Extrusion] = ExtrusionOffset
-
-		Animations[Extrusion] = {
+	local function addDroplet(partScale, offset)
+		local droplet = DropletPool:Get()
+		local mesh = droplet:FindFirstChild("Mesh")
+		mesh.Scale = Vector3.new(partScale, partScale, partScale)
+		mesh.Offset = EMPTY_VEC
+		droplet.Color = Settings.Tint
+		droplet.Transparency = 0.7
+		Offsets[droplet] = offset
+		Animations[droplet] = {
 			startClock = os.clock(),
-			scale = ExtrusionScale,
-			stretch = (math.random(5, 10) / 10) * ExtrusionScale,
-			mesh = Extrusion.Mesh,
+			scale = partScale,
+			stretch = (0.5 + math.random() * 0.5) * partScale,
+			mesh = mesh,
 		}
+		droplet.Parent = ScreenDroplets
+	end
 
-		Extrusion.Parent = ScreenDroplets
+	addDroplet(scale, mainOffset)
+
+	for _ = 1, math.random(1, 4) do
+		local extrusionScale = math.max(scale / 1.5 + ((math.random() * 2 - 1) * (scale / 3)), scale * 0.1)
+		local radius = extrusionScale * 0.6
+		local extrusionOffset = mainOffset * CFrame.new(math.random() * 2 * radius - radius, math.random() * 2 * radius - radius, 0)
+		addDroplet(extrusionScale, extrusionOffset)
 	end
 end
 
-local ScreenRain = {
-	Enabled = false,
-	_activeUpdater = false,
-}
-
-function ScreenRain:Enable(settings)
-	self.Enabled = true
-	self:Configure(settings)
-
-	if self._activeUpdater then
-		return
-	end
-	self._activeUpdater = true
-
-	-- Droplet spawn/animation loop
+task.spawn(function()
 	local accumulatedChance = 0
-	task.defer(function()
-		local lastCheck = os.clock()
+	local lastCheck = os.clock()
 
-		while task.wait(Settings.UpdateFreq) do
-			if (not self.Enabled) and (not next(Animations)) then
-				self._activeUpdater = false
-				break
-			end
+	while true do
+		task.wait(math.max(Settings.UpdateFreq, 1 / 240))
+		local now = os.clock()
 
-			debug.profilebegin("ScreenRainUpdate")
-			local now = os.clock()
-
-			debug.profilebegin("Animations")
-			for Droplet, Data in pairs(Animations) do
-				local startClock = Data.startClock
-
-				local elapsed = now - startClock
-				if elapsed >= Settings.Fade then
-					Cleanup(Droplet)
-					continue
-				end
-
-				local mesh, scale, stretch = Data.mesh, Data.scale, Data.stretch
-				local alpha = (elapsed / Settings.Fade)
-				local quint = alpha * alpha * alpha * alpha
-				local y = scale + (stretch * quint)
-
-				Droplet.Transparency = 0.7 + (0.3 * (alpha * alpha))
-				mesh.Scale = Vector3.new(scale, y, scale)
-				mesh.Offset = Vector3.new(0, y / -2, 0)
-			end
-			debug.profileend()
-
-			debug.profilebegin("Droplet Creation")
-			if self.Enabled and GlassGraphics and CameraCF.LookVector.Y > -0.4 and not UnderObject(CameraCF.Position) then
-				accumulatedChance += (now - lastCheck) * Settings.Rate
-
-				for _ = 1, math.floor(accumulatedChance) do
-					CreateDroplet()
-				end
-
-				accumulatedChance %= 1
+		for droplet, data in pairs(Animations) do
+			local elapsed = now - data.startClock
+			if elapsed >= Settings.Fade then
+				cleanup(droplet)
 			else
-				accumulatedChance %= 1
+				local alpha = elapsed / Settings.Fade
+				local y = data.scale + data.stretch * alpha * alpha * alpha * alpha
+				droplet.Transparency = 0.7 + 0.3 * alpha * alpha
+				data.mesh.Scale = Vector3.new(data.scale, y, data.scale)
+				data.mesh.Offset = Vector3.new(0, y / -2, 0)
 			end
-			debug.profileend()
-
-			lastCheck = now
-			debug.profileend()
 		end
-	end)
-end
 
-function ScreenRain:Disable()
-	self.Enabled = false
-end
-
-function ScreenRain:Configure(settings)
-	if type(settings) == "table" then
-		for k, v in pairs(settings) do
-			Settings[k] = v
+		if screenRainEnabled and GlassGraphics and CameraCF.LookVector.Y > -0.4 and not underObject(CameraCF.Position) then
+			accumulatedChance += (now - lastCheck) * Settings.Rate
+			local count = math.floor(accumulatedChance)
+			for _ = 1, count do
+				createDroplet()
+			end
+			accumulatedChance %= 1
+		else
+			accumulatedChance %= 1
 		end
+
+		lastCheck = now
 	end
-end
+end)
 
--- Public API: loadstring(...)() returns it, and it is also stored in getgenv().RainAPI
-local RAIN_FADE_IN = 5 -- seconds, same fade the script always used on start
-local RAIN_FADE_OUT = 2 -- seconds
+--!nonstrict
+-- RealRain v4 | client | glass droplets that sit / slide / drip off parts, bodies, accessories, special meshes
+-- + falling glass drops + settings panel. API: getgenv().RealRain
+-- v4: physically based. Drop sizes, fall speeds, wind slant, sliding, pinning and drips are computed in SI units
+--     (see the PHYSICS section) and follow Workspace.Gravity. Default preset: HIGH.
 
-local RainAPI = {}
-local rainEnabled = false
-local rainHooks = {} -- filled in by the weather section below
+local env = (getgenv and getgenv()) or _G
+if env.RealRain then pcall(env.RealRain.Destroy) end
 
-function RainAPI:Enable(fadeTime)
-	if rainEnabled then
-		return
-	end
-	rainEnabled = true
-	_G.Raining = true
-	ScreenRain:Enable()
-	if rainHooks.Enable then
-		local hookOk, hookError = pcall(rainHooks.Enable, fadeTime or RAIN_FADE_IN)
-		if not hookOk then
-			warn("[Rain] the rain itself failed to start: " .. tostring(hookError))
-		end
-	end
-end
-
-function RainAPI:Disable(fadeTime)
-	if not rainEnabled then
-		return
-	end
-	rainEnabled = false
-	_G.Raining = false
-	ScreenRain:Disable()
-	if rainHooks.Disable then
-		rainHooks.Disable(fadeTime or RAIN_FADE_OUT)
-	end
-end
-
-function RainAPI:IsEnabled()
-	return rainEnabled
-end
-
-getgenv().RainAPI = RainAPI
-getgenv().Rain = true
-pcall(function()
-
-s=Instance.new'Sound';
-s.Parent=game.CoreGui;
-s.SoundId='rbxassetid://8114441138';
-s.Pitch=1;
-s.Volume=.3;
-s.Looped=true;
-s:play();
-local ambientSound1 = s
-
-wait(0.1)
-
-
-s=Instance.new'Sound';
-s.Parent=game.CoreGui;
-s.SoundId='rbxassetid://5911952995';
-s.Pitch=1.3;
-s.Volume=.8;
-s.Looped=true;
-s:play();
-local ambientSound2 = s
-
-
-wait(0.1)
-local colors = {
-	BrickColor.new("White"),
-	BrickColor.new("White"),
-	BrickColor.new("Really black"),
-	BrickColor.new("Really black"),
-}
-wait(0.1)
-local bright = game.Lighting.Brightness
-
-function prop(part, parent, collide, tran, ref, x, y, z, color, anchor, form)
-	part.Parent = parent
-	part.formFactor = form
-	part.CanCollide = collide
-	part.Transparency = tran
-	part.Material = 'Neon'
-	part.Reflectance = ref
-	part.Size = Vector3.new(x,y,z)
-	part.BrickColor = BrickColor.new(color)
-	part.TopSurface = 0
-	part.BottomSurface = 0
-	part.Anchored = anchor
-	part.Locked = true
-	part:BreakJoints()
-end
---[[task.spawn(function()
-for i = 0,100 do
-	wait(0.01) 
-	c = Instance.new("Part") 
-	c.Position = Vector3.new(math.random(-100,100),math.random(0,50),math.random(-100,100)) 
-	c.Transparency = 1
-	c.Reflectance = 0 
-	c.Size = Vector3.new(0.5, 0.5, 0.5) 
-	c.BrickColor = BrickColor.new(23) 
-	c.CanCollide = true 
-	c.Locked = true 
-	c.Anchored = false 
-	c.Shape = 0 
-	c.Parent = game.Workspace 
-end
-end)]]
-task.wait()
-
---[[
-	
-	Rain module v1.0 by buildthomas (July 2018)
-	
-	This module is licensed under the APLv2:
-	http://www.apache.org/licenses/LICENSE-2.0
-	
-	In short, you may use this code only if you agree to the following:
-	* This notice must always be present and may not be modified or removed in any copy of this code or derived code.
-	* You may use this in commercial, closed source projects, and you may modify the source code itself.
-	
-	Refer to the license for a full description.
-	
-	For questions please reach out on the Developer Forum (@buildthomas)
-	or via Twitter (https://www.twitter.com/buildthomasRBX)
-	
-	------
-	
-	
-	Rain:Enable(<TweenInfo> tweenInfo)
-		Enable the rain effects instantly, or over a given easing function if tweenInfo is given.
-		
-	Rain:Disable(<TweenInfo> tweenInfo)
-		Disable the rain effects instantly, or over a given easing function if tweenInfo is given.
-		
-		
-	Rain:SetColor(<Color3> color, <TweenInfo> tweenInfo)
-		Set the global color of all rain particles to a given Color3 value.
-		Sets the color instantly, or over a given easing function if tweenInfo is given.
-		Color sequences are not supported because this would lead to a messy effect.
-		The starting value is RAIN_DEFAULT_COLOR.
-		
-	Rain:SetTransparency(<number> transparency, <TweenInfo> tweenInfo)
-		Set the global transparency of all rain effects. 0 = regular visibility, 1 = fully invisible.
-		Sets the transparency instantly, or over a given easing function if tweenInfo is given.
-		Clamped between 0 and 1, the starting value is RAIN_DEFAULT_TRANSPARENCY.
-	
-	Rain:SetSpeedRatio(<number> ratio, <TweenInfo> tweenInfo)
-		Set the vertical falling speed of the rain particles. 0 = still, 1 = max falling speed.
-		Sets the speed instantly, or over a given easing function if tweenInfo is given.
-		Clamped between 0 and 1, the starting value is RAIN_DEFAULT_SPEEDRATIO.
-		
-	Rain:SetIntensityRatio(<number> ratio, <TweenInfo> tweenInfo)
-		Set the intensity of the rain. 0 = no effects, 1 = full effects.
-		Sets the intensity instantly, or over a given easing function if tweenInfo is given.
-		Clamped between 0 and 1, the starting value is RAIN_DEFAULT_INTENSITYRATIO.
-		
-	Rain:SetLightEmission(<number> ratio, <TweenInfo> tweenInfo)
-		Set the global light emission of all rain effects.
-		Sets the light emission instantly, or over a given easing function if tweenInfo is given.
-		Clamped between 0 and 1, the starting value is RAIN_DEFAULT_LIGHTEMISSION.
-		
-	Rain:SetLightInfluence(<number> transparency, <TweenInfo> tweenInfo)
-		Set the global light influence of all rain effects.
-		Sets the light influence instantly, or over a given easing function if tweenInfo is given.
-		Clamped between 0 and 1, the starting value is RAIN_DEFAULT_LIGHTINFLUENCE.
-		
-		
-	Rain:SetVolume(<number> volume, <TweenInfo> tweenInfo)
-		Set the global max volume of rain instantly, or over a given easing function if tweenInfo is given.
-		The initial volume of the rain's soundgroup is RAIN_SOUND_BASEVOLUME.
-		
-		
-	Rain:SetCeiling(<Variant<number, nil>> ceiling)
-		Set a Y coordinate that marks the ceiling of the world. Above this spot, rain will act as if it's indoors.
-		Feed nil to remove any previously set ceiling.
-		
-		
-	Rain:SetDirection(<Vector3> direction, <TweenInfo> tweenInfo)
-		Set the direction that rain falls from. The direction parameter should be a unit direction.
-		Sets the rain direction instantly, or over a given easing function if tweenInfo is given.
-		
-	Rain:SetStraightTexture(<string> asset)
-	Rain:SetTopDownTexture(<string> asset)
-	Rain:SetSplashTexture(<string> asset)
-		Adjust textures of the rain effect.
-		
-	Rain:SetSoundId(<string> asset)
-		Adjust sound effect of the rain effect.
-		
-	Rain:SetCollisionMode(<Rain.CollisionMode> mode, ...)
-		Sets the current way collisions are determined for the rain.
-		
-		Rain.CollisionMode
-			A table that should be seen as an enumerator for the collision mode.
-			The following values are available:
-			* Rain.CollisionMode.None			- All parts in the default collision group will block the rain.
-			* Rain.CollisionMode.Whitelist		- Use the whitelist provided by Rain::SetCollisionWhitelist.
-			* Rain.CollisionMode.Blacklist		- Use the blacklist provided by Rain::SetCollisionBlacklist.
-			* Rain.CollisionMode.Function		- Use the test function provided by Rain::SetCollisionFunction and do deep-casts.
-			
-		Rain:SetCollisionMode(Rain.CollisionMode.None)
-			No parameters.
-			
-		Rain:SetCollisionMode(Rain.CollisionMode.Whitelist, <Variant<Instance, table>> whitelist)
-			The provided value can either be a hierarchy of objects or a table of objects to filter with.
-		
-		Rain:SetCollisionMode(Rain.CollisionMode.Blacklist, <Variant<Instance, table>> blacklist)
-			The provided value can either be a hierarchy of objects or a table of objects to filter out.
-			
-		Rain:SetCollisionMode(Rain.CollisionMode.Function, <function<BasePart -> boolean>> f)
-			If f(part) returns a value that lua evaluates to a true condition, that part can be hit by rain.
-			If f(part) returns any other value, that part cannot be hit by the rain.
-			
-	
---]]
-
--- Options:
-
-local MIN_SIZE = Vector3.new(0.05,0.05,0.05)				-- Size of main emitter part when rain inactive
-
-local RAIN_DEFAULT_COLOR = Color3.new(1,1,1)				-- Default color3 of all rain elements
-local RAIN_DEFAULT_TRANSPARENCY = 0							-- Default transparency scale ratio of all rain elements
-local RAIN_DEFAULT_SPEEDRATIO = 1							-- Default speed scale ratio of falling rain effects
-local RAIN_DEFAULT_INTENSITYRATIO = 1						-- Default intensity ratio of all rain elements
-local RAIN_DEFAULT_LIGHTEMISSION = 0.05						-- Default LightEmission of all rain elements
-local RAIN_DEFAULT_LIGHTINFLUENCE = 0.9						-- Default LightInfluence of all rain elements
-local RAIN_DEFAULT_DIRECTION = Vector3.new(0,-1,0)			-- Default direction for rain to fall into
-
-local RAIN_TRANSPARENCY_T1 = .25							-- Define the shape (time-wise) of the transparency curves for emitters
-local RAIN_TRANSPARENCY_T2 = .75
-
-local RAIN_SCANHEIGHT = 1000								-- How many studs to scan up from camera position to determine whether occluded
-
-local RAIN_EMITTER_DIM_DEFAULT = 40							-- Size of emitter block to the side/up
-local RAIN_EMITTER_DIM_MAXFORWARD = 100						-- Size of emitter block forwards when looking at the horizon
-local RAIN_EMITTER_UP_MODIFIER = 20							-- Maximum vertical displacement of emitter (when looking fully up/down)
-
-local RAIN_SOUND_ASSET = "rbxassetid://1516791621"
-local RAIN_SOUND_BASEVOLUME = 0.2							-- Starting volume of rain sound effect when not occluded
-local RAIN_SOUND_FADEIN_TIME = 1							-- Tween in/out times for sound volume
-local RAIN_SOUND_FADEOUT_TIME = 1
-
-local RAIN_STRAIGHT_ASSET = "rbxassetid://1822883048"		-- Some properties of the straight rain particle effect
-local RAIN_STRAIGHT_ALPHA_LOW = 0.7							-- Minimum particle transparency for the straight rain emitter
-local RAIN_STRAIGHT_SIZE = NumberSequence.new(10)
-local RAIN_STRAIGHT_LIFETIME = NumberRange.new(0.8)
-local RAIN_STRAIGHT_MAX_RATE = 600							-- Maximum rate for the straight rain emitter
-local RAIN_STRAIGHT_MAX_SPEED = 60							-- Maximum speed for the straight rain emitter
-
-local RAIN_TOPDOWN_ASSET = "rbxassetid://1822856633"		-- Some properties of the top-down rain particle effect
-local RAIN_TOPDOWN_ALPHA_LOW = 0.85							-- Minimum particle transparency for the top-down rain emitter
-local RAIN_TOPDOWN_SIZE = NumberSequence.new {
-	NumberSequenceKeypoint.new(0, 5.33, 2.75);
-	NumberSequenceKeypoint.new(1, 5.33, 2.75);
-}			
-local RAIN_TOPDOWN_LIFETIME = NumberRange.new(0.8)
-local RAIN_TOPDOWN_ROTATION = NumberRange.new(0,360)
-local RAIN_TOPDOWN_MAX_RATE = 600							-- Maximum rate for the top-down rain emitter
-local RAIN_TOPDOWN_MAX_SPEED = 60							-- Maximum speed for the top-down rain emitter
-
-local RAIN_SPLASH_ASSET = "rbxassetid://1822856633"			-- Some properties of the splash particle effect
-local RAIN_SPLASH_ALPHA_LOW = 0.6							-- Minimum particle transparency for the splash emitters
-local RAIN_SPLASH_SIZE = NumberSequence.new {				
-	NumberSequenceKeypoint.new(0, 0);
-	NumberSequenceKeypoint.new(.4, 3);
-	NumberSequenceKeypoint.new(1, 0);
-}
-local RAIN_SPLASH_LIFETIME = NumberRange.new(0.1, 0.15)
-local RAIN_SPLASH_ROTATION = NumberRange.new(0,360)
-local RAIN_SPLASH_NUM = 20									-- Amount of splashes per frame
-local RAIN_SPLASH_CORRECTION_Y = .5							-- Offset from impact position for visual reasons
-local RAIN_SPLASH_STRAIGHT_OFFSET_Y = 50					-- Offset against rain direction for straight rain particles from splash position
-local RAIN_NOSPLASH_STRAIGHT_OFFSET_Y_MIN = 20				-- Min/max vertical offset from camera height for straight rain particles
-local RAIN_NOSPLASH_STRAIGHT_OFFSET_Y_MAX = 100				-- when no splash position could be found (i.e. no floor at that XZ-column)
-
-local RAIN_OCCLUDED_MINSPEED = 70							-- Minimum speed for the occluded straight rain emitters
-local RAIN_OCCLUDED_MAXSPEED = 100							-- Maximum speed for the occluded straight rain emitters
-local RAIN_OCCLUDED_SPREAD = Vector2.new(10,10)				-- Spread angle for the occluded straight rain emitters
-local RAIN_OCCLUDED_MAXINTENSITY = 2						-- How many occluded straight rain particles are emitted for every splash for max intensity
-
-local RAIN_OCCLUDECHECK_OFFSET_Y = 500						-- Vertical offset from camera height to start scanning downward from for splashes
-local RAIN_OCCLUDECHECK_OFFSET_XZ_MIN = -100				-- Range of possible XZ offset values from camera XZ position for the splashes
-local RAIN_OCCLUDECHECK_OFFSET_XZ_MAX = 100
-local RAIN_OCCLUDECHECK_SCAN_Y = 550						-- Scan magnitude along rain path
-
-local RAIN_UPDATE_PERIOD = 6								-- Update the transparency of the main emitters + volume of rain inside every X frames
-
-local RAIN_VOLUME_SCAN_RADIUS = 35							-- Defining grid for checking how far the camera is away from a spot exposed to rain
-local RAIN_VOLUME_SCAN_GRID = {								-- Unit range grid for scanning how far away user is from rain space
-	-- range 0.2, 4 pts
-	Vector3.new(0.141421363, 0, 0.141421363);
-	Vector3.new(-0.141421363, 0, 0.141421363);
-	Vector3.new(-0.141421363, 0, -0.141421363);
-	Vector3.new(0.141421363, 0, -0.141421363);
-	-- range 0.4, 8 pts
-	Vector3.new(0.400000006, 0, 0);
-	Vector3.new(0.282842726, 0, 0.282842726);
-	Vector3.new(2.44929371e-17, 0, 0.400000006);
-	Vector3.new(-0.282842726, 0, 0.282842726);
-	Vector3.new(-0.400000006, 0, 4.89858741e-17);
-	Vector3.new(-0.282842726, 0, -0.282842726);
-	Vector3.new(-7.34788045e-17, 0, -0.400000006);
-	Vector3.new(0.282842726, 0, -0.282842726);
-	-- range 0.6, 10 pts
-	Vector3.new(0.600000024, 0, 0);
-	Vector3.new(0.485410213, 0, 0.352671146);
-	Vector3.new(0.185410202, 0, 0.570633948);
-	Vector3.new(-0.185410202, 0, 0.570633948);
-	Vector3.new(-0.485410213, 0, 0.352671146);
-	Vector3.new(-0.600000024, 0, 7.34788112e-17);
-	Vector3.new(-0.485410213, 0, -0.352671146);
-	Vector3.new(-0.185410202, 0, -0.570633948);
-	Vector3.new(0.185410202, 0, -0.570633948);
-	Vector3.new(0.485410213, 0, -0.352671146);
-	-- range 0.8, 12 pts
-	Vector3.new(0.772740662, 0, 0.207055241);
-	Vector3.new(0.565685451, 0, 0.565685451);
-	Vector3.new(0.207055241, 0, 0.772740662);
-	Vector3.new(-0.207055241, 0, 0.772740662);
-	Vector3.new(-0.565685451, 0, 0.565685451);
-	Vector3.new(-0.772740662, 0, 0.207055241);
-	Vector3.new(-0.772740662, 0, -0.207055241);
-	Vector3.new(-0.565685451, 0, -0.565685451);
-	Vector3.new(-0.207055241, 0, -0.772740662);
-	Vector3.new(0.207055241, 0, -0.772740662);
-	Vector3.new(0.565685451, 0, -0.565685451);
-	Vector3.new(0.772740662, 0, -0.207055241);
-}
-
-
--- Enumerators:
-
-local CollisionMode = {
-	None = 0;
-	Whitelist = 1;
-	Blacklist = 2;
-	Function = 3;
-}
-
-
--- Variables & setup:
-
--- services
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local AssetService = game:GetService("AssetService")
+local plr = Players.LocalPlayer
 
-local GlobalModifier = Instance.new("NumberValue")			-- modifier for rain visibility for disabling/enabling over time span
-GlobalModifier.Value = 1									-- 0 = fully visible, 1 = invisible
+local rng = Random.new()
+local V3 = Vector3.new
+local floor, max, min, sqrt, sin, cos, exp, pi, rad = math.floor, math.max, math.min, math.sqrt, math.sin, math.cos, math.exp, math.pi, math.rad
+local ZERO = Vector3.zero
+local function rand(a, b) return a + (b - a) * rng:NextNumber() end
+local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
+local function rem(t, i) t[i] = t[#t]; t[#t] = nil end
 
-local connections = {}										-- Stores connections to RunService signals when enabled
-
-local disabled = true										-- Value to figure out whether we are moving towards a disabled state (useful during tweens)
-
-local rainDirection = RAIN_DEFAULT_DIRECTION				-- Direction that rain falls into
-
-local currentCeiling = nil									-- Y coordinate of ceiling (if present)
-
-local collisionMode = CollisionMode.None					-- Collision mode (from Rain.CollisionMode) for raycasting
-local collisionList = nil									-- Blacklist/whitelist for raycasting
-local collisionFunc = nil									-- Raycasting test function for when collisionMode == Rain.CollisionMode.Function
-
-local straightLowAlpha = 1									-- Current transparency for straight rain particles
-local topdownLowAlpha = 1									-- Current transparency for top-down rain particles
-local intensityOccludedRain = 0								-- Current intensity of occluded rain particles
-local numSplashes = 0										-- Current number of generated splashes per frame
-local volumeTarget = 0										-- Current (target of tween for) sound volume
-
--- shorthands
-local v3 = Vector3.new
-local NSK010 = NumberSequenceKeypoint.new(0, 1, 0)
-local NSK110 = NumberSequenceKeypoint.new(1, 1, 0)
-
-local volumeScanGrid = {}									-- Pre-generate grid used for raining area distance scanning
-for _,v in pairs(RAIN_VOLUME_SCAN_GRID) do
-	table.insert(volumeScanGrid, v * RAIN_VOLUME_SCAN_RADIUS)
-end
-table.sort(volumeScanGrid, function(a,b)					-- Optimization: sort from close to far away for fast evaluation if closeby
-	return a.magnitude < b.magnitude
-end)
-
--- sound group for easy main volume tweaking
-local SoundGroup = Instance.new("SoundGroup")
-SoundGroup.Name = "__RainSoundGroup"
-SoundGroup.Volume = RAIN_SOUND_BASEVOLUME
-SoundGroup.Archivable = false
-
-local Sound = Instance.new("Sound")
-Sound.Name = "RainSound"
-Sound.Volume = volumeTarget
-Sound.SoundId = RAIN_SOUND_ASSET
-Sound.Looped = true
-Sound.SoundGroup = SoundGroup
-Sound.Parent = SoundGroup
-Sound.Archivable = false
-
--- emitter block around camera used when outside
-local Emitter do
-	
-	Emitter = Instance.new("Part")
-	Emitter.Transparency = 1
-	Emitter.Anchored = true
-	Emitter.CanCollide = false
-	Emitter.CanTouch = false
-	Emitter.CanQuery = false
-	Emitter.Locked = false
-	Emitter.Archivable = false
-	Emitter.TopSurface = Enum.SurfaceType.Smooth
-	Emitter.BottomSurface = Enum.SurfaceType.Smooth
-	Emitter.Name = "__RainEmitter"
-	Emitter.Size = MIN_SIZE
-	Emitter.Archivable = false
-	
-	local straight = Instance.new("ParticleEmitter")
-	straight.Name = "RainStraight"
-	straight.LightEmission = RAIN_DEFAULT_LIGHTEMISSION
-	straight.LightInfluence = RAIN_DEFAULT_LIGHTINFLUENCE
-	straight.Size = RAIN_STRAIGHT_SIZE
-	straight.Texture = RAIN_STRAIGHT_ASSET
-	straight.LockedToPart = true
-	straight.Enabled = false
-	straight.Lifetime = RAIN_STRAIGHT_LIFETIME
-	straight.Rate = RAIN_STRAIGHT_MAX_RATE
-	straight.Speed = NumberRange.new(RAIN_STRAIGHT_MAX_SPEED)
-	straight.EmissionDirection = Enum.NormalId.Bottom
-	straight.Parent = Emitter
-	
-	local topdown = Instance.new("ParticleEmitter")
-	topdown.Name = "RainTopDown"
-	topdown.LightEmission = RAIN_DEFAULT_LIGHTEMISSION
-	topdown.LightInfluence = RAIN_DEFAULT_LIGHTINFLUENCE
-	topdown.Size = RAIN_TOPDOWN_SIZE
-	topdown.Texture = RAIN_TOPDOWN_ASSET
-	topdown.LockedToPart = true
-	topdown.Enabled = false
-	topdown.Rotation = RAIN_TOPDOWN_ROTATION
-	topdown.Lifetime = RAIN_TOPDOWN_LIFETIME
-	topdown.Rate = RAIN_TOPDOWN_MAX_RATE
-	topdown.Speed = NumberRange.new(RAIN_TOPDOWN_MAX_SPEED)
-	topdown.EmissionDirection = Enum.NormalId.Bottom
-	topdown.Parent = Emitter
-	
-end
-
--- FIX: safe-access helper. Some games (anti-exploit cleanup, weather resets, Terrain
--- streaming) will silently Destroy() instances this module parents into workspace.Terrain
--- or workspace.CurrentCamera. Indexing a missing child directly (e.g. v.RainStraight)
--- throws "X is not a valid member of Y" every single frame, which is what was flooding
--- the Output window and tanking framerate. child() returns the real instance when it
--- exists, or a silent no-op sink when it doesn't, so property writes never error.
-local DUMMY_SINK = setmetatable({}, {
-	__newindex = function() end,
-	__index = function() return nil end,
-})
-local function child(inst, name)
-	return (inst and inst:FindFirstChild(name)) or DUMMY_SINK
-end
-
-local splashAttachments, rainAttachments, splashParticles, rainStraightParticles, rainTopdownParticles do
-	
-	splashAttachments = {}
-	rainAttachments = {}
-	splashParticles = {}
-	rainStraightParticles = {}
-	rainTopdownParticles = {}
-	
-	for i = 1, RAIN_SPLASH_NUM do
-		
-		-- splashes on ground
-		local splashAttachment = Instance.new("Attachment")
-		splashAttachment.Name = "__RainSplashAttachment"
-		local splash = Instance.new("ParticleEmitter")
-		splash.LightEmission = RAIN_DEFAULT_LIGHTEMISSION
-		splash.LightInfluence = RAIN_DEFAULT_LIGHTINFLUENCE
-		splash.Size = RAIN_SPLASH_SIZE
-		splash.Texture = RAIN_SPLASH_ASSET
-		splash.Rotation = RAIN_SPLASH_ROTATION
-		splash.Lifetime = RAIN_SPLASH_LIFETIME
-		splash.Transparency = NumberSequence.new {
-			NSK010;
-			NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T1, RAIN_SPLASH_ALPHA_LOW, 0);
-			NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T2, RAIN_SPLASH_ALPHA_LOW, 0);
-			NSK110;
-		}
-		splash.Enabled = false
-		splash.Rate = 0
-		splash.Speed = NumberRange.new(0)
-		splash.Name = "RainSplash"
-		splash.Parent = splashAttachment
-		splashAttachment.Archivable = false
-		table.insert(splashAttachments, splashAttachment)
-		table.insert(splashParticles, splash)
-		
-		-- occluded rain particle generation
-		local rainAttachment = Instance.new("Attachment")
-		rainAttachment.Name = "__RainOccludedAttachment"
-		local straightOccluded = child(Emitter,"RainStraight"):Clone()
-		straightOccluded.Speed = NumberRange.new(RAIN_OCCLUDED_MINSPEED, RAIN_OCCLUDED_MAXSPEED)
-		straightOccluded.SpreadAngle = RAIN_OCCLUDED_SPREAD
-		straightOccluded.LockedToPart = false
-		straightOccluded.Enabled = false
-		straightOccluded.Parent = rainAttachment
-		local topdownOccluded = child(Emitter,"RainTopDown"):Clone()
-		topdownOccluded.Speed = NumberRange.new(RAIN_OCCLUDED_MINSPEED, RAIN_OCCLUDED_MAXSPEED)
-		topdownOccluded.SpreadAngle = RAIN_OCCLUDED_SPREAD
-		topdownOccluded.LockedToPart = false
-		topdownOccluded.Enabled = false
-		topdownOccluded.Parent = rainAttachment
-		rainAttachment.Archivable = false
-		table.insert(rainAttachments, rainAttachment)
-		table.insert(rainStraightParticles, straightOccluded)
-		table.insert(rainTopdownParticles, topdownOccluded)
-		
-	end
-	
-end
-
-
--- Helper methods:
-
-local ignoreEmitterList = { Emitter }
-
-local raycastFunctions = {
-	[CollisionMode.None] = function(ray, ignoreCharacter)
-		return workspace:FindPartOnRayWithIgnoreList(ray, ignoreCharacter and {Emitter, Players.LocalPlayer and Players.LocalPlayer.Character} or ignoreEmitterList)
-	end;
-	[CollisionMode.Blacklist] = function(ray)
-		return workspace:FindPartOnRayWithIgnoreList(ray, collisionList)
-	end;
-	[CollisionMode.Whitelist] = function(ray)
-		return workspace:FindPartOnRayWithWhitelist(ray, collisionList)
-	end;
-	[CollisionMode.Function] = function(ray)
-		local destination = ray.Origin + ray.Direction
-		-- draw multiple raycasts concatenated to each other until no hit / valid hit found
-		while ray.Direction.magnitude > 0.001 do
-			local part, pos, norm, mat = workspace:FindPartOnRayWithIgnoreList(ray, ignoreEmitterList)
-			if not part or collisionFunc(part) then
-				return part, pos, norm, mat
-			end
-			local start = pos + ray.Direction.Unit * 0.001
-			ray = Ray.new(start, destination - start)
-		end
-	end;
+---------------------------------------------------------------- config
+local CFG = {
+	Enabled = _G.Rain ~= false, Rate = 110, MaxParts = 1400, Material = "Glass", WaterColor = 1, CastShadow = false, AutoQuality = true, TargetFPS = 42,
+	WorldScale = 3.571, Intensity = 30, DropMinMM = 0.6, DropMaxMM = 5.8, Shutter = 0.02,
+	FallRate = 1700, MaxFall = 1900, FallWidth = 0.035, FallTrans = 0.95, FallSplash = 0.06,
+	FallNearRadius = 24, FallFarRadius = 70, FallNearShare = 0.6,
+	DropSize = 0.08, NominalDiameter = 3, SizeMin = 0.6, SizeMax = 1.4, TransMin = 0.5, TransMax = 0.75, Flatness = 0.5, AppearTime = 0.12,
+	SlideChance = 0.4, MaxSliders = 80, MinFlow = 0.15, SlideStretch = 0.6, Hysteresis = 1, ContactFriction = 0.15, FilmThickness = 12,
+	StaticLifeMin = 1.5, StaticLifeMax = 3, SliderLifeMin = 2, SliderLifeMax = 4,
+	Trails = true, StepMin = 0.04, StepMax = 0.09, WidthMin = 0.4, WidthMax = 0.7, AgeTaper = 0.5, TrailLifeMin = 1, TrailLifeMax = 2,
+	Drips = true, DetachAngle = -0.4, Relanding = true,
+	AreaRadius = 30, BodyRate = 120,
+	Wind = false, WindDir = 0, WindStrength = 6, Gustiness = 0.4, GustSpeed = 0.6, SlideInfluence = 0.3,
+	Wobble = 0.2, WobbleSpeed = 8, NormalSmoothing = 0.3, SeamForgive = 0.15, SurfaceSnap = 0.15,
+	PreciseMesh = true,
+	Shelter = true, RoofHeight = 50,
 }
-local raycast = raycastFunctions[collisionMode]
+local PRESETS = {
+	LOW = { Rate = 45, MaxParts = 450, FallRate = 500, MaxFall = 600, MaxSliders = 20, Trails = false, PreciseMesh = false },
+	MEDIUM = { Rate = 75, MaxParts = 800, FallRate = 1000, MaxFall = 1200, MaxSliders = 45, Trails = true, PreciseMesh = true },
+	HIGH = { Rate = 110, MaxParts = 1400, FallRate = 1700, MaxFall = 1900, MaxSliders = 80, Trails = true, PreciseMesh = true },
+	ULTRA = { Rate = 170, MaxParts = 2400, FallRate = 2400, MaxFall = 2600, MaxSliders = 130, Trails = true, PreciseMesh = true },
+}
+local MATS = { "Glass", "Ice", "SmoothPlastic", "Plastic", "ForceField", "Neon" }
+local COLORS = {
+	Color3.fromRGB(205, 228, 247), Color3.fromRGB(255, 255, 255), Color3.fromRGB(120, 190, 255),
+	Color3.fromRGB(150, 240, 170), Color3.fromRGB(255, 175, 135),
+}
 
-local function connectLoop()
-	
-	local rand = Random.new()
-	
-	local inside = true					-- Whether camera is currently in a spot occluded from the sky
-	local frame = RAIN_UPDATE_PERIOD	-- Frame counter, and force update cycle right now
-	
-	-- Update Emitter on RenderStepped since it needs to be synced to Camera
-	table.insert(connections, RunService.RenderStepped:connect(function()
-		
-		-- Check if camera is outside or inside
-		local part, position = raycast(Ray.new(workspace.CurrentCamera.CFrame.p, -rainDirection * RAIN_SCANHEIGHT), true)
-		
-		if (not currentCeiling or workspace.CurrentCamera.CFrame.p.y <= currentCeiling) and not part then
-			
-			-- Camera is outside and under ceiling
-				
-			if volumeTarget < 1 and not disabled then
-				volumeTarget = 1
-				TweenService:Create(Sound, TweenInfo.new(.5), {Volume = 1}):Play()
-			end
-			
-			frame = RAIN_UPDATE_PERIOD
-			
-			local t = math.abs(workspace.CurrentCamera.CFrame.lookVector:Dot(rainDirection))
-			
-			local center = workspace.CurrentCamera.CFrame.p
-			local right = workspace.CurrentCamera.CFrame.lookVector:Cross(-rainDirection)
-			right = right.magnitude > 0.001 and right.unit or -rainDirection
-			local forward = rainDirection:Cross(right).unit
-			
-			Emitter.Size = v3(
-				RAIN_EMITTER_DIM_DEFAULT,
-				RAIN_EMITTER_DIM_DEFAULT,
-				RAIN_EMITTER_DIM_DEFAULT + (1 - t)*(RAIN_EMITTER_DIM_MAXFORWARD - RAIN_EMITTER_DIM_DEFAULT)
-			)
-			
-			Emitter.CFrame =
-				CFrame.new(
-					center.x, center.y, center.z,
-					right.x, -rainDirection.x, forward.x,
-					right.y, -rainDirection.y, forward.y,
-					right.z, -rainDirection.z, forward.z
-				)
-				+ (1 - t) * workspace.CurrentCamera.CFrame.lookVector * Emitter.Size.Z/3
-				- t * rainDirection * RAIN_EMITTER_UP_MODIFIER
-			
-			child(Emitter,"RainStraight").Enabled = true
-			child(Emitter,"RainTopDown").Enabled = true
-			
-			inside = false
-			
-		else
-			
-			-- Camera is inside / above ceiling
-			
-			child(Emitter,"RainStraight").Enabled = false
-			child(Emitter,"RainTopDown").Enabled = false
-		
-			inside = true
-			
+-- contact-angle hysteresis (cos receding - cos advancing) per surface: how hard the surface pins a bead.
+-- smooth hard surfaces are low (beads run), rough / absorbent ones are high (beads sit or soak in).
+local HYST = {
+	Glass = 0.20, Ice = 0.18, Glacier = 0.20, Foil = 0.25, Metal = 0.30, SmoothPlastic = 0.30, Neon = 0.30, ForceField = 0.30,
+	CeramicTiles = 0.30, Plastic = 0.35, Marble = 0.35, DiamondPlate = 0.45, Granite = 0.45,
+	Wood = 0.60, WoodPlanks = 0.60, Slate = 0.60, Rubber = 0.70, ClayRoofTiles = 0.70, CorrodedMetal = 0.75,
+	Concrete = 0.80, RoofShingles = 0.80, Leather = 0.80, Plaster = 0.90, Brick = 0.90, Asphalt = 0.90, Pavement = 0.90,
+	Basalt = 0.90, Rock = 0.90, Limestone = 0.90, Cobblestone = 0.90, Pebble = 0.90, CrackedLava = 1.0,
+	Sandstone = 1.4, Cardboard = 1.6, Grass = 1.6, LeafyGrass = 1.6, Fabric = 2.5, Carpet = 2.5,
+	Sand = 3, Ground = 3, Mud = 3, Salt = 3, Snow = 3,
+}
+
+---------------------------------------------------------------- state
+local alive = true
+local conns = {}
+local now, dt = os.clock(), 1 / 60
+local q, fpsAvg = 1, 60
+local cam = Workspace.CurrentCamera
+local camPos, flatLook = ZERO, ZERO
+local W, rainDir = ZERO, V3(0, -1, 0)
+local rays, rayCap, splashN = 0, 50, 0
+local camSh = false
+
+local rainF = Instance.new("Folder"); rainF.Name = "RealRain"; rainF.Parent = Workspace
+local proxyF = Instance.new("Folder"); proxyF.Name = "RealRainProxies"; proxyF.Parent = Workspace
+
+local rp, sp = RaycastParams.new(), RaycastParams.new()
+rp.FilterType = Enum.RaycastFilterType.Exclude
+sp.FilterType = Enum.RaycastFilterType.Exclude
+local excl, proxyOf, models = {}, {}, {}
+local filtersDirty = true
+
+local function setFilters()
+	local a = { rainF }
+	if cam then a[#a + 1] = cam end
+	for i = #excl, 1, -1 do
+		if excl[i].Parent == nil then rem(excl, i) else a[#a + 1] = excl[i] end
+	end
+	rp.FilterDescendantsInstances = a
+	local b = { rainF, proxyF }
+	if cam then b[#b + 1] = cam end
+	for _, m in ipairs(models) do b[#b + 1] = m end
+	sp.FilterDescendantsInstances = b
+	filtersDirty = false
+end
+
+local function ray(o, d)
+	rays += 1
+	local r = Workspace:Raycast(o, d, rp)
+	if r then
+		local i = r.Instance
+		local base = proxyOf[i] or i
+		if base.Transparency > 0.9 or base.LocalTransparencyModifier > 0.9 then return nil end
+	end
+	return r
+end
+
+local function sheltered(p)
+	if not CFG.Shelter then return false end
+	local r = Workspace:Raycast(p, -rainDir * CFG.RoofHeight, sp)
+	return r ~= nil and r.Instance.Transparency < 0.8
+end
+
+local function perp(n)
+	local a = n:Cross(Vector3.yAxis)
+	if a.Magnitude < 0.1 then a = n:Cross(Vector3.xAxis) end
+	return a.Unit
+end
+local function frame(pos, up, dir)
+	local x = dir and (dir - up * dir:Dot(up)) or nil
+	if not x or x.Magnitude < 1e-4 then x = perp(up) else x = x.Unit end
+	return CFrame.fromMatrix(pos, x, up)
+end
+
+---------------------------------------------------------------- physics (SI based)
+-- Everything dynamic is evaluated in SI units and converted to studs with two numbers:
+--   WorldScale  studs per metre (Roblox convention: 1 stud = 0.28 m = 3.571 studs/m)
+--   time scale  chosen so that Workspace.Gravity equals 9.81 m/s^2 in that unit system. Falling drops, drips and sliding
+--               beads therefore obey the same gravity as every other part in the game, and follow it if a game changes it.
+-- Models: Marshall-Palmer drop sizes, Atlas et al. terminal speeds, quadratic air drag (wind = relative velocity),
+-- Furmidge's sliding condition for a bead on a plate (gravity vs contact-line pinning) with viscous contact-line friction.
+local G0, RHO_W, GAMMA, K_WIND = 9.81, 1000, 0.072, 9.0e-4
+local REF_SPEED = 72 -- fall speed (studs/s) that FallRate / MaxFall were tuned at; keeps the visual rain density unchanged
+local GE = Workspace.Gravity
+local LS, TS, VS, AS = 3.571, 2.366, 8.452, 20 -- studs/m, rate scale, velocity scale (studs/s per m/s), acceleration scale
+local lamV, meanD, rainSpeed = 2, 2, REF_SPEED
+
+local function terminalSpeed(dmm) -- m/s for a drop of dmm millimetres (Atlas et al. 1973 fit to Gunn & Kinzer)
+	if dmm < 0.3 then dmm = 0.3 end
+	return 9.65 - 10.3 * exp(-0.6 * dmm)
+end
+
+local function sampleDiameter() -- mm; mass-weighted Marshall-Palmer (the drops that actually carry the rain) = Gamma(4, 1/lambda)
+	local theta = 1 / lamV
+	for _ = 1, 4 do
+		local d = -theta * math.log(rng:NextNumber() * rng:NextNumber() * rng:NextNumber() * rng:NextNumber() + 1e-9)
+		if d >= CFG.DropMinMM and d <= CFG.DropMaxMM then return d end
+	end
+	return meanD
+end
+
+local function updatePhysics()
+	GE = max(Workspace.Gravity, 1)
+	LS = max(CFG.WorldScale, 0.1)
+	AS = GE / G0
+	TS = sqrt(AS / LS)
+	VS = LS * TS
+	lamV = 4.1 * max(CFG.Intensity, 0.1) ^ (-0.21) -- Marshall-Palmer slope (1/mm)
+	meanD = clamp(4 / lamV, CFG.DropMinMM, CFG.DropMaxMM)
+end
+
+-- accelerations on a bead sitting on a surface with normal n (studs/s^2): the driving push along the surface, and the pinning threshold
+local function forces(n, Dm, hyst, flow, out)
+	local drive = V3(0, -GE, 0)
+	drive = drive - n * drive:Dot(n)
+	if W.X ~= 0 or W.Z ~= 0 then -- aerodynamic drag of the wind on the bead (reduced by the boundary layer: SlideInfluence)
+		local wt = W - n * W:Dot(n)
+		local wm = wt.Magnitude
+		if wm > 1e-3 then
+			local u = wm / VS * CFG.SlideInfluence
+			drive = drive + wt * ((K_WIND * u * u / Dm * AS) / wm)
 		end
-		
-	end))
+	end
+	if flow then -- small tops: water films over the rim, so no pinning and a gentle push toward the edge
+		if drive.Magnitude < GE * 0.2 then drive = drive + out * (GE * 0.3) end
+		return drive, 0
+	end
+	return drive, 6 * GAMMA * hyst / (pi * RHO_W * Dm * Dm) * AS -- Furmidge: m*g*sin(a) > gamma*w*(cos_r - cos_a), w ~ D
+end
 
-	-- Do the other effects on Stepped
-	local signal = RunService:IsRunning() and RunService.Stepped or RunService.RenderStepped
-	table.insert(connections, signal:connect(function()
-		
-		frame = frame + 1
-		
-		-- Only do some updates once every few frames
-		if frame >= RAIN_UPDATE_PERIOD then
-			
-			-- Measure of how much camera is facing down (0-1)
-			local t = math.abs(workspace.CurrentCamera.CFrame.lookVector:Dot(rainDirection))
-			
-			-- More looking down = see straight particles less and see top-down particles more
-			local straightSequence = NumberSequence.new {
-				NSK010;
-				NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T1, (1 - t)*straightLowAlpha + t, 0);
-				NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T2, (1 - t)*straightLowAlpha + t, 0);
-				NSK110;
+---------------------------------------------------------------- bead pool (every droplet / trail / drip is one of these)
+local free, beads = {}, {}
+local MAT, COL = Enum.Material.Glass, COLORS[1]
+
+local function newBead()
+	local p = Instance.new("Part")
+	p.Anchored = true; p.CanCollide = false; p.CanTouch = false; p.CanQuery = false
+	p.CastShadow = CFG.CastShadow; p.Material = MAT; p.Color = COL
+	p.Size = V3(0.05, 0.05, 0.05)
+	local m = Instance.new("SpecialMesh"); m.MeshType = Enum.MeshType.Sphere; m.Parent = p
+	beads[#beads + 1] = p
+	return p
+end
+local function getBead()
+	local p = table.remove(free)
+	if p then return p end
+	if #beads >= CFG.MaxParts then return nil end
+	return newBead()
+end
+local function drop(p) p.Parent = nil; free[#free + 1] = p end
+
+local mvP, mvC, mvN = {}, {}, 0
+local function mv(p, cf) mvN += 1; mvP[mvN] = p; mvC[mvN] = cf end
+
+local S, L, T, D, V = {}, {}, {}, {}, {} -- statics, sliders, trails, drips, vanishing
+local function vanish(p, size) V[#V + 1] = { p = p, t0 = now, sz = size } end
+
+---------------------------------------------------------------- splash particles
+local splashes, splashI = {}, 0
+for i = 1, 16 do
+	local a = Instance.new("Attachment"); a.Parent = Workspace.Terrain
+	local e = Instance.new("ParticleEmitter")
+	e.Enabled = false; e.Rate = 0
+	e.Lifetime = NumberRange.new(0.16, 0.3)
+	e.Speed = NumberRange.new(3, 7)
+	e.SpreadAngle = Vector2.new(55, 55)
+	e.Acceleration = V3(0, -60, 0)
+	e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.07), NumberSequenceKeypoint.new(1, 0.02) })
+	e.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.35), NumberSequenceKeypoint.new(1, 1) })
+	e.Color = ColorSequence.new(Color3.fromRGB(225, 238, 250))
+	e.LightEmission = 0.2; e.LockedToPart = false
+	e.Parent = a
+	splashes[i] = { a = a, e = e }
+end
+local function splash(pos, n, cnt)
+	if splashN >= 6 or not CFG.Enabled then return end
+	splashN += 1
+	splashI = splashI % #splashes + 1
+	local s = splashes[splashI]
+	s.a.WorldCFrame = frame(pos + n * 0.02, n)
+	s.e:Emit(cnt or 2)
+end
+
+local pGE, pLS = 0, 0
+local function syncSplash() -- ejected droplets are ballistic too: world gravity, ~0.6-1.8 m/s ejection, flight time follows
+	local flight = 2.2 * VS / GE
+	for _, s in ipairs(splashes) do
+		s.e.Acceleration = V3(0, -GE, 0)
+		s.e.Speed = NumberRange.new(0.6 * VS, 1.8 * VS)
+		s.e.Lifetime = NumberRange.new(flight * 0.5, flight * 1.5)
+	end
+end
+
+---------------------------------------------------------------- droplets
+local newDrop, startDrip, isBodyPart
+local ap = 0.12
+
+function newDrop(res, sizeMul)
+	local inst, n, pos = res.Instance, res.Normal, res.Position
+	if res.Material == Enum.Material.Water then return end
+	local dist = (pos - camPos).Magnitude
+	if dist > 85 then return end
+	if n.Y > 0.3 and rng:NextNumber() < 0.5 then splash(pos, n, 2) end
+	local p = getBead()
+	if not p then return end
+	local f = rand(CFG.SizeMin, CFG.SizeMax) * (sizeMul or 1) -- one random factor drives the drawn size and the physical diameter
+	local sz = CFG.DropSize * f * (1 + dist / 40)
+	local Dm = CFG.NominalDiameter * f * 0.001 -- bead diameter in metres
+	local fl = CFG.Flatness
+	local tr = rand(CFG.TransMin, CFG.TransMax)
+	p.Transparency = tr
+	p.Size = V3(sz, sz * fl, sz) * 0.25
+	local cf = frame(pos + n * (sz * fl * 0.2), n)
+	p.CFrame = cf
+	p.Parent = rainF
+
+	local host, hcf = nil, nil
+	if not inst.Anchored then host = inst; hcf = inst.CFrame end
+
+	-- can this bead run? gravity along the surface (+ wind) has to beat the contact-line pinning of its material
+	if #L < CFG.MaxSliders * q and dist < 60 and rng:NextNumber() < CFG.SlideChance then
+		local body = isBodyPart(proxyOf[inst] or inst)
+		local hBase = body and 0.45 or (HYST[res.Material.Name] or 0.5)
+		local hyst = hBase * CFG.Hysteresis * rand(0.75, 1.3)
+		local small = n.Y > 0.5 and inst.Size.Magnitude < 14 and hBase < 1.2
+		local out = pos - inst.Position
+		out = out - n * out:Dot(n)
+		out = out.Magnitude > 1e-3 and out.Unit or perp(n)
+		local drive, pin = forces(n, Dm, hyst, small, out)
+		if drive.Magnitude > pin * 1.1 or n.Y < CFG.DetachAngle then
+			local V0 = pi * Dm * Dm * Dm / 6
+			local s = {
+				p = p, pos = pos, nrm = n, vel = ZERO, sz = sz, sz0 = sz, fl = fl, tr = tr,
+				sw = sz * rand(CFG.WidthMin, CFG.WidthMax), th = sz * fl * 0.6,
+				tail = pos, born = now, life = rand(CFG.SliderLifeMin, CFG.SliderLifeMax),
+				acc = 0, nxt = rand(CFG.StepMin, CFG.StepMax), ph = rand(0, 6.28),
+				out = out, flow = small, slow = 0, host = host, hcf = hcf, hi = inst,
+				segMax = max(sz * 5, 0.25),
+				Dm = Dm, Dm0 = Dm, V = V0, V0 = V0, hyst = hyst,
 			}
-			local topdownSequence = NumberSequence.new {
-				NSK010;
-				NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T1, t*topdownLowAlpha + (1 - t), 0);
-				NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T2, t*topdownLowAlpha + (1 - t), 0);
-				NSK110;
-			}
-			
-			-- Find desired rotation for the straight rain particles
-			local mapped = workspace.Camera.CFrame:inverse() * (workspace.Camera.CFrame.p - rainDirection)
-			local straightRotation = NumberRange.new(math.deg(math.atan2(-mapped.x, mapped.y)))
-			
-			if inside then
-				
-				-- Update emitter properties
-				for _,v in pairs(rainAttachments) do
-					child(v,"RainStraight").Transparency = straightSequence
-					child(v,"RainStraight").Rotation = straightRotation
-					child(v,"RainTopDown").Transparency = topdownSequence
+			s.sw0 = s.sw
+			if CFG.Trails then
+				local seg = getBead()
+				if seg then
+					seg.Transparency = min(1, tr + 0.12); seg.Size = V3(0.01, 0.01, 0.01)
+					seg.CFrame = cf; seg.Parent = rainF
+					s.seg = seg
 				end
-				
-				if not disabled then
-					
-					-- Only do occluded volume check if not moving towards disabled state
-					
-					local volume = 0
-					
-					if (not currentCeiling or workspace.CurrentCamera.CFrame.p.y <= currentCeiling) then
-						
-						-- Check how far away camera is from a space open to the sky using volume scan grid
-						
-						local minDistance = RAIN_VOLUME_SCAN_RADIUS
-						local rayDirection = -rainDirection * RAIN_SCANHEIGHT
-						
-						for i = 1, #volumeScanGrid do -- In order, so first hit is closest
-							if not raycast(Ray.new(workspace.CurrentCamera.CFrame * volumeScanGrid[i], rayDirection), true) then
-								minDistance = volumeScanGrid[i].magnitude
-								break
-							end
-						end
-						
-						-- Volume is inversely proportionate to minimum distance
-						volume = 1 - minDistance / RAIN_VOLUME_SCAN_RADIUS
-						
-					end
-					
-					if math.abs(volume - volumeTarget) > .01 then
-						-- Value is sufficiently different from previous target, overwrite it
-						volumeTarget = volume
-						TweenService:Create(Sound, TweenInfo.new(1), {Volume = volumeTarget}):Play()
-					end
-					
-				end
-				
-			else
-				
-				-- Update emitter properties
-				child(Emitter,"RainStraight").Transparency = straightSequence
-				child(Emitter,"RainStraight").Rotation = straightRotation
-				child(Emitter,"RainTopDown").Transparency = topdownSequence
-				
 			end
-			
-			-- Reset frame counter
-			frame = 0
-			
+			L[#L + 1] = s
+			return
 		end
-		
-		local center = workspace.CurrentCamera.CFrame.p
-		local right = workspace.CurrentCamera.CFrame.lookVector:Cross(-rainDirection)
-		right = right.magnitude > 0.001 and right.unit or -rainDirection
-		local forward = rainDirection:Cross(right).unit
-		local transform = CFrame.new(
-			center.x, center.y, center.z,
-			right.x, -rainDirection.x, forward.x,
-			right.y, -rainDirection.y, forward.y,
-			right.z, -rainDirection.z, forward.z
-		)
-		local rayDirection = rainDirection * RAIN_OCCLUDECHECK_SCAN_Y
-		
-		-- Splash and occlusion effects
-		for i = 1, numSplashes do
-			
-			local splashAttachment = splashAttachments[i]
-			local rainAttachment = rainAttachments[i]
-			local splashParticle = splashParticles[i]
-			local rainStraightParticle = rainStraightParticles[i]
-			local rainTopdownParticle = rainTopdownParticles[i]
-			
-			-- Sample random splash position
-			local x = rand:NextNumber(RAIN_OCCLUDECHECK_OFFSET_XZ_MIN, RAIN_OCCLUDECHECK_OFFSET_XZ_MAX)
-			local z = rand:NextNumber(RAIN_OCCLUDECHECK_OFFSET_XZ_MIN, RAIN_OCCLUDECHECK_OFFSET_XZ_MAX)
-			local part, position, normal = raycast(Ray.new(transform * v3(x, RAIN_OCCLUDECHECK_OFFSET_Y, z), rayDirection))
-			
-			if part then
-				
-				-- Draw a splash at hit
-				splashAttachment.Position = position + normal * RAIN_SPLASH_CORRECTION_Y
-				splashParticle:Emit(1)
-				
-				if inside then
-					
-					-- Draw occlusion rain particles a little bit above the splash position
-					local corrected = position - rainDirection * RAIN_SPLASH_STRAIGHT_OFFSET_Y
-					if currentCeiling and corrected.Y > currentCeiling and rainDirection.Y < 0 then
-						corrected = corrected + rainDirection * (currentCeiling - corrected.Y) / rainDirection.Y
-					end
-					rainAttachment.CFrame = transform - transform.p + corrected
-					rainStraightParticle:Emit(intensityOccludedRain)
-					rainTopdownParticle:Emit(intensityOccludedRain)
-					
-				end
-				
-			elseif inside then
-				
-				-- Draw occlusion rain particles on the XZ-position at around the camera's height
-				local corrected = transform * v3(x, rand:NextNumber(RAIN_NOSPLASH_STRAIGHT_OFFSET_Y_MIN, RAIN_NOSPLASH_STRAIGHT_OFFSET_Y_MAX), z)
-				if currentCeiling and corrected.Y > currentCeiling and rainDirection.Y < 0 then
-					corrected = corrected + rainDirection * (currentCeiling - corrected.Y) / rainDirection.Y
-				end
-				rainAttachment.CFrame = transform - transform.p + corrected
-				rainStraightParticle:Emit(intensityOccludedRain)
-				rainTopdownParticle:Emit(intensityOccludedRain)
-				
-			end
-			
-		end
-		
-	end))
-
-end
-
-local function disconnectLoop()
-	-- If present, disconnect all RunService connections
-	if #connections > 0 then
-		for _,v in pairs(connections) do
-			v:disconnect()
-		end
-		connections = {}
 	end
-end
-
-local function disableSound(tweenInfo)
-	
-	-- Tween the rain sound to be mute over a given easing function
-	volumeTarget = 0
-	local tween = TweenService:Create(Sound, tweenInfo, {Volume = 0})
-	tween.Completed:connect(function(state)
-		if state == Enum.PlaybackState.Completed then
-			Sound:Stop()
-		end
-		tween:Destroy()
-	end)
-	tween:Play()
-	
-end
-
-local function disable()
-	
-	disconnectLoop()
-	
-	-- Hide Emitter
-	child(Emitter,"RainStraight").Enabled = false
-	child(Emitter,"RainTopDown").Enabled = false
-	Emitter.Size = MIN_SIZE
-	
-	-- Disable sound now if not tweened into disabled state beforehand
-	if not disabled then
-		disableSound(TweenInfo.new(RAIN_SOUND_FADEOUT_TIME))
-	end
-	
-end
-
--- Shorthand for creating a tweenable "variable" using value object
-local function makeProperty(valueObjectClass, defaultValue, setter)
-	local valueObject = Instance.new(valueObjectClass)
-	if defaultValue then
-		valueObject.Value = defaultValue
-	end
-	valueObject.Changed:connect(setter)
-	setter(valueObject.Value)
-	return valueObject
-end
-
-local Color = makeProperty("Color3Value", RAIN_DEFAULT_COLOR, function(value)
-	
-	local value = ColorSequence.new(value)
-	
-	child(Emitter,"RainStraight").Color = value
-	child(Emitter,"RainTopDown").Color = value
-	
-	for _,v in pairs(splashAttachments) do
-		child(v,"RainSplash").Color = value
-	end
-	for _,v in pairs(rainAttachments) do
-		child(v,"RainStraight").Color = value
-		child(v,"RainTopDown").Color = value
-	end
-	
-end)
-
-local function updateTransparency(value)
-	
-	local opacity = (1 - value) * (1 - GlobalModifier.Value)
-	local transparency = 1 - opacity
-	
-	straightLowAlpha = RAIN_STRAIGHT_ALPHA_LOW * opacity + transparency
-	topdownLowAlpha = RAIN_TOPDOWN_ALPHA_LOW * opacity + transparency
-	
-	local splashSequence = NumberSequence.new {
-		NSK010;
-		NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T1, opacity*RAIN_SPLASH_ALPHA_LOW + transparency, 0);
-		NumberSequenceKeypoint.new(RAIN_TRANSPARENCY_T2, opacity*RAIN_SPLASH_ALPHA_LOW + transparency, 0);
-		NSK110;
+	S[#S + 1] = {
+		p = p, pos = pos, nrm = n, sz = sz, fl = fl, cf = cf, born = now,
+		life = rand(CFG.StaticLifeMin, CFG.StaticLifeMax), host = host, hcf = hcf,
 	}
-	
-	for _,v in pairs(splashAttachments) do
-		child(v,"RainSplash").Transparency = splashSequence
-	end
-	
 end
-local Transparency = makeProperty("NumberValue", RAIN_DEFAULT_TRANSPARENCY, updateTransparency)
-GlobalModifier.Changed:connect(updateTransparency)
 
-local SpeedRatio = makeProperty("NumberValue", RAIN_DEFAULT_SPEEDRATIO, function(value)
-	
-	child(Emitter,"RainStraight").Speed = NumberRange.new(value * RAIN_STRAIGHT_MAX_SPEED)
-	child(Emitter,"RainTopDown").Speed = NumberRange.new(value * RAIN_TOPDOWN_MAX_SPEED)
-	
-end)
-
-local IntensityRatio = makeProperty("NumberValue", RAIN_DEFAULT_INTENSITYRATIO, function(value)
-	
-	child(Emitter,"RainStraight").Rate = RAIN_STRAIGHT_MAX_RATE * value
-	child(Emitter,"RainTopDown").Rate = RAIN_TOPDOWN_MAX_RATE * value
-	
-	intensityOccludedRain = math.ceil(RAIN_OCCLUDED_MAXINTENSITY * value)
-	numSplashes = RAIN_SPLASH_NUM * value
-	
-end)
-
-local LightEmission = makeProperty("NumberValue", RAIN_DEFAULT_LIGHTEMISSION, function(value)
-	
-	child(Emitter,"RainStraight").LightEmission = value
-	child(Emitter,"RainTopDown").LightEmission = value
-	
-	for _,v in pairs(rainAttachments) do
-		child(v,"RainStraight").LightEmission = value
-		child(v,"RainTopDown").LightEmission = value
+function startDrip(pos, vel, sz, bead, Dm)
+	if not CFG.Drips or #D >= 60 then
+		vanish(bead, bead.Size)
+		return
 	end
-	for _,v in pairs(splashAttachments) do
-		child(v,"RainSplash").LightEmission = value
+	D[#D + 1] = { p = bead, pos = pos, vel = vel, sz = sz, born = now, vt = terminalSpeed((Dm or 0.003) * 1000) }
+end
+
+local function segCF(s, a, b)
+	local d = b - a
+	local l = d.Magnitude
+	if l < 1e-4 then return nil, nil end
+	return V3(l + s.sw, s.th, s.sw), frame((a + b) * 0.5 + s.nrm * (s.th * 0.25), s.nrm, d / l)
+end
+
+local function stampTrail(s, keep)
+	local seg = s.seg
+	if not seg then return end
+	local size, cf = segCF(s, s.tail, s.pos)
+	if not size then
+		if not keep then drop(seg); s.seg = nil end
+		return
 	end
-	
-end)
-
-local LightInfluence = makeProperty("NumberValue", RAIN_DEFAULT_LIGHTINFLUENCE, function(value)
-	
-	child(Emitter,"RainStraight").LightInfluence = value
-	child(Emitter,"RainTopDown").LightInfluence = value
-	
-	for _,v in pairs(rainAttachments) do
-		child(v,"RainStraight").LightInfluence = value
-		child(v,"RainTopDown").LightInfluence = value
-	end
-	for _,v in pairs(splashAttachments) do
-		child(v,"RainSplash").LightInfluence = value
-	end
-	
-end)
-
-local RainDirection = makeProperty("Vector3Value", RAIN_DEFAULT_DIRECTION, function(value)
-	if value.magnitude > 0.001 then
-		rainDirection = value.unit
-	end
-end)
-
-
--- Exposed API:
-
-local Rain = {}
-
-Rain.CollisionMode = CollisionMode
-
-function Rain:Enable(tweenInfo)
-	
-	if tweenInfo ~= nil and typeof(tweenInfo) ~= "TweenInfo" then
-		error("bad argument #1 to 'Enable' (TweenInfo expected, got " .. typeof(tweenInfo) .. ")", 2)
-	end
-	
-	disconnectLoop() -- Just in case :Enable(..) is called multiple times on accident
-	
-	-- Parent safely: if anything was destroyed while the rain was off, the raw
-	-- assignment throws and used to abort the whole Enable, leaving only the
-	-- screen droplets. Now a failure is reported once and the rest still runs.
-	local parentFailures, firstParentError = 0, nil
-	local function safeParent(inst, parent)
-		local ok, err = pcall(function()
-			inst.Parent = parent
-		end)
-		if not ok then
-			parentFailures += 1
-			firstParentError = firstParentError or (tostring(inst.Name) .. ": " .. tostring(err))
+	seg.Size = size; seg.CFrame = cf
+	T[#T + 1] = {
+		p = seg, born = now, life = rand(CFG.TrailLifeMin, CFG.TrailLifeMax), len = size.X, th = s.th, sw = s.sw,
+		t0 = seg.Transparency, nu = now + 0.1, host = s.host, hcf = s.hcf, cf = cf,
+	}
+	s.seg = nil
+	if keep then
+		local nb = getBead()
+		if nb then
+			nb.Transparency = min(1, s.tr + 0.12); nb.Size = V3(0.01, 0.01, 0.01)
+			nb.CFrame = cf; nb.Parent = rainF
+			s.seg = nb
 		end
 	end
-	
-	child(Emitter,"RainStraight").Enabled = true
-	child(Emitter,"RainTopDown").Enabled = true
-	safeParent(Emitter, workspace.CurrentCamera)
-	
-	for i = 1, RAIN_SPLASH_NUM do
-		safeParent(splashAttachments[i], workspace.Terrain)
-		safeParent(rainAttachments[i], workspace.Terrain)
-	end
-	
-	if RunService:IsRunning() then -- don't need sound in studio preview, it won't work anyway
-		safeParent(SoundGroup, game:GetService("SoundService"))
-	end
-	
-	if parentFailures > 0 then
-		warn("[Rain] " .. parentFailures .. " rain object(s) couldn't be re-parented (first: " .. tostring(firstParentError) .. ")")
-	end
-	
-	connectLoop()
-	
-	if tweenInfo then
-		TweenService:Create(GlobalModifier, tweenInfo, {Value = 0}):Play()
-	else
-		GlobalModifier.Value = 0
-	end
-	
-	if not Sound.Playing then
-		Sound:Play()
-		Sound.TimePosition = math.random()*Sound.TimeLength
-	end
-	
-	disabled = false
-	
+	s.tail = s.pos
 end
 
-function Rain:Disable(tweenInfo)
-	
-	if tweenInfo ~= nil and typeof(tweenInfo) ~= "TweenInfo" then
-		error("bad argument #1 to 'Disable' (TweenInfo expected, got " .. typeof(tweenInfo) .. ")", 2)
+local function finishSlider(s)
+	stampTrail(s, false)
+	vanish(s.p, s.p.Size)
+end
+
+-- returns 0 = keep, 1 = end, 2 = became a drip
+local function stepSlider(s, h)
+	local n, pos = s.nrm, s.pos
+
+	-- pendant bead: on an underside it hangs, elongates as it swells, then pinches off from rest
+	if not s.hang and n.Y < CFG.DetachAngle then
+		stampTrail(s, false)
+		s.hang = now; s.hangT = rand(0.12, 0.4); s.fl0 = s.fl; s.vel = ZERO
 	end
-	
-	if tweenInfo then
-		local tween = TweenService:Create(GlobalModifier, tweenInfo, {Value = 1})
-		tween.Completed:connect(function(state)
-			if state == Enum.PlaybackState.Completed then
-				-- Only disable the rain completely once the visual effects are faded out
-				disable()
+	if s.hang then
+		local k = clamp((now - s.hang) / s.hangT, 0, 1)
+		s.fl = s.fl0 + (1.15 - s.fl0) * k * k
+		if k >= 1 then
+			startDrip(pos + n * 0.02, ZERO, s.sz, s.p, s.Dm)
+			return 2
+		end
+		return 0
+	end
+
+	-- force balance along the surface: gravity + wind shear - contact-line pinning, resisted by contact-line friction
+	local drive, pin = forces(n, s.Dm, s.hyst, s.flow, s.out)
+	local dm = drive.Magnitude
+	local net = dm > pin and drive * (1 - pin / dm) or ZERO
+	local cE = 6 * CFG.ContactFriction / (pi * RHO_W * s.Dm * s.Dm) * TS
+	local v = (s.vel + net * h) / (1 + cE * h)
+	v = v - n * v:Dot(n)
+	local spd = v.Magnitude
+	if spd < CFG.MinFlow then s.slow += h else s.slow = 0 end
+	if s.slow > 0.4 then return 1 end
+
+	local d = v * h
+	if spd > 0.02 then
+		d = d + n:Cross(v / spd) * (sin(now * CFG.WobbleSpeed + s.ph) * CFG.Wobble * spd * h)
+	end
+	local dl = d.Magnitude
+	if dl < 1e-5 then s.vel = v; return 0 end
+	local dir = d / dl
+	local snap = CFG.SurfaceSnap
+	local np = pos + d
+	local res
+
+	-- obstacle ahead (inner corner / wall)
+	res = ray(pos + n * snap, dir * (dl + s.sz * 0.6))
+	if res and res.Normal:Dot(n) < 0.95 then
+		np = res.Position
+	else
+		res = ray(np + n * snap, -n * (snap * 2 + s.sz))
+		if not res then
+			res = ray(np + dir * CFG.SeamForgive + n * snap, -n * (snap * 2 + s.sz))
+		end
+		if not res then
+			-- wrap around the edge onto the side face
+			res = ray(np - n * 0.3, -dir * (dl + 0.4))
+		end
+		if not res then
+			-- ran off an edge: the bead leaves with the speed it had
+			stampTrail(s, false)
+			startDrip(np + n * 0.01, v, s.sz, s.p, s.Dm)
+			return 2
+		end
+	end
+
+	local rn = res.Normal
+	local nn
+	if n:Dot(rn) > 0.5 then
+		nn = n * CFG.NormalSmoothing + rn * (1 - CFG.NormalSmoothing)
+		nn = nn.Magnitude > 1e-3 and nn.Unit or rn
+	else
+		nn = rn
+	end
+	s.pos = res.Position; s.nrm = nn
+	s.vel = v - nn * v:Dot(nn)
+	local hi = res.Instance
+	if hi ~= s.hi then
+		s.hi = hi
+		if hi.Anchored then s.host = nil; s.hcf = nil else s.host = hi; s.hcf = hi.CFrame end
+	end
+
+	-- the moving bead leaves a thin film behind it: it loses volume, shrinks, and stops once pinning wins (pinning grows as 1/D^2)
+	local ds = (res.Position - pos).Magnitude / LS
+	s.V -= 0.5 * s.Dm * CFG.FilmThickness * 1e-6 * ds
+	if s.V < s.V0 * 0.166 then return 1 end
+	s.Dm = (6 * s.V / pi) ^ (1 / 3)
+	local sh = s.Dm / s.Dm0
+	s.sz = s.sz0 * sh; s.th = s.sz * s.fl * 0.6; s.sw = s.sw0 * sh
+
+	if s.seg and (s.pos - s.tail).Magnitude >= s.segMax then stampTrail(s, true) end
+	return 0
+end
+
+local function drawSlider(s)
+	local age = now - s.born
+	local k = min(1, 0.25 + 0.75 * age / ap)
+	local spd = s.vel.Magnitude
+	local dir = spd > 0.02 and s.vel / spd or s.out
+	local pp = s.pos + s.vel * s.acc
+	local n = s.nrm
+	local st = 1 + CFG.SlideStretch * clamp(spd / 3, 0, 1) * 2
+	s.p.Size = V3(s.sz * st, s.sz * s.fl, s.sz) * k
+	mv(s.p, frame(pp + n * (s.sz * s.fl * 0.2), n, dir))
+	if s.seg then
+		local size, cf = segCF(s, s.tail, pp)
+		if size then s.seg.Size = size; mv(s.seg, cf) end
+	end
+end
+
+---------------------------------------------------------------- precise characters (accessories / special meshes)
+local queued, pq = {}, {}
+local function scanChar(m)
+	if not CFG.PreciseMesh then return end
+	for _, d in ipairs(m:GetDescendants()) do
+		if not queued[d] then
+			if d:IsA("MeshPart") and d.MeshId ~= "" then
+				queued[d] = true
+				pq[#pq + 1] = { part = d, id = d.MeshId }
+			elseif d:IsA("SpecialMesh") and d.MeshType == Enum.MeshType.FileMesh and d.MeshId ~= "" and d.Parent and d.Parent:IsA("BasePart") then
+				queued[d] = true
+				pq[#pq + 1] = { part = d.Parent, id = d.MeshId, sm = d }
 			end
-			tween:Destroy()
-		end)
-		tween:Play()
-		-- Start tweening out sound now as well
-		disableSound(tweenInfo)
-	else
-		GlobalModifier.Value = 1
-		disable()
-	end
-	
-	disabled = true
-	
-end
-
-function Rain:SetColor(value, tweenInfo)
-		
-	if typeof(value) ~= "Color3" then
-		error("bad argument #1 to 'SetColor' (Color3 expected, got " .. typeof(value) .. ")", 2)
-	elseif tweenInfo ~= nil and typeof(tweenInfo) ~= "TweenInfo" then
-		error("bad argument #2 to 'SetColor' (TweenInfo expected, got " .. typeof(tweenInfo) .. ")", 2)
-	end
-	
-	if tweenInfo then
-		TweenService:Create(Color, tweenInfo, {Value = value}):Play()
-	else
-		Color.Value = value
-	end
-	
-end
-
-local function makeRatioSetter(methodName, valueObject)
-	-- Shorthand because most of the remaining property setters are very similar
-	return function(_, value, tweenInfo)
-		
-		if typeof(value) ~= "number" then
-			error("bad argument #1 to '" .. methodName .. "' (number expected, got " .. typeof(value) .. ")", 2)
-		elseif tweenInfo ~= nil and typeof(tweenInfo) ~= "TweenInfo" then
-			error("bad argument #2 to '" .. methodName .. "' (TweenInfo expected, got " .. typeof(tweenInfo) .. ")", 2)
 		end
-		
-		value = math.clamp(value, 0, 1)
-		
-		if tweenInfo then
-			TweenService:Create(valueObject, tweenInfo, {Value = value}):Play()
+	end
+end
+
+local function makeProxy(job)
+	local orig = job.part
+	if not orig.Parent or not CFG.PreciseMesh then return end
+	local mp = AssetService:CreateMeshPartAsync(Content.fromUri(job.id), { CollisionFidelity = Enum.CollisionFidelity.PreciseConvexDecomposition })
+	if not alive or not orig:IsDescendantOf(Workspace) then mp:Destroy(); return end
+	local off = CFrame.identity
+	if job.sm then
+		mp.Size = mp.Size * job.sm.Scale
+		off = CFrame.new(job.sm.Offset)
+	else
+		mp.Size = orig.Size
+	end
+	mp.CFrame = orig.CFrame * off
+	mp.Anchored = false; mp.CanCollide = false; mp.CanQuery = true; mp.CanTouch = false
+	mp.Massless = true; mp.Transparency = 1; mp.CastShadow = false
+	mp.Parent = proxyF
+	local w = Instance.new("WeldConstraint"); w.Part0 = orig; w.Part1 = mp; w.Parent = mp
+	proxyOf[mp] = orig
+	excl[#excl + 1] = orig
+	filtersDirty = true
+	orig.Destroying:Connect(function()
+		proxyOf[mp] = nil
+		mp:Destroy()
+		filtersDirty = true
+	end)
+end
+
+task.spawn(function()
+	while alive do
+		local job = table.remove(pq, 1)
+		if job then
+			pcall(makeProxy, job)
+			task.wait(0.12)
 		else
-			valueObject.Value = value
+			task.wait(0.4)
 		end
-		
+	end
+end)
+
+---------------------------------------------------------------- characters / sheltered
+local chars, nextChars, nextScan = {}, 0, 0
+local function refreshChars()
+	local list, ms = {}, {}
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local c = pl.Character
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		if r then
+			ms[#ms + 1] = c
+			if pl == plr or (r.Position - camPos).Magnitude < 55 then
+				list[#list + 1] = { m = c, r = r, loc = pl == plr, sh = false }
+			end
+		end
+	end
+	models = ms
+	filtersDirty = true
+	setFilters()
+	for _, c in ipairs(list) do c.sh = sheltered(c.r.Position + V3(0, 3, 0)) end
+	chars = list
+	if now >= nextScan then
+		nextScan = now + 2
+		for i = 1, min(#list, 6) do scanChar(list[i].m) end
 	end
 end
 
-Rain.SetTransparency = makeRatioSetter("SetTransparency", Transparency)
-Rain.SetSpeedRatio = makeRatioSetter("SetSpeedRatio", SpeedRatio)
-Rain.SetIntensityRatio = makeRatioSetter("SetIntensityRatio", IntensityRatio)
-Rain.SetLightEmission = makeRatioSetter("SetLightEmission", LightEmission)
-Rain.SetLightInfluence = makeRatioSetter("SetLightInfluence", LightInfluence)
+---------------------------------------------------------------- falling drops
+local fallParts, fallFree, fallDrops = {}, {}, {}
+local fallSpawnAccumulator = 0
+local bodyDropAccumulator = 0
+local bodyPartCache = setmetatable({}, { __mode = "k" })
 
-function Rain:SetVolume(volume, tweenInfo)
-	
-	if typeof(volume) ~= "number" then
-		error("bad argument #1 to 'SetVolume' (number expected, got " .. typeof(volume) .. ")", 2)
-	elseif tweenInfo ~= nil and typeof(tweenInfo) ~= "TweenInfo" then
-		error("bad argument #2 to 'SetVolume' (TweenInfo expected, got " .. typeof(tweenInfo) .. ")", 2)
-	end
-	
-	if tweenInfo then
-		TweenService:Create(SoundGroup, tweenInfo, {Volume = volume}):Play()
-	else
-		SoundGroup.Volume = volume
-	end
-	
+function isBodyPart(instance)
+	local cached = bodyPartCache[instance]
+	if cached ~= nil then return cached end
+	local model = instance:FindFirstAncestorOfClass("Model")
+	local result = model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
+	bodyPartCache[instance] = result
+	return result
 end
 
-function Rain:SetDirection(direction, tweenInfo)
-	
-	if typeof(direction) ~= "Vector3" then
-		error("bad argument #1 to 'SetDirection' (Vector3 expected, got " .. typeof(direction) .. ")", 2)
-	elseif tweenInfo ~= nil and typeof(tweenInfo) ~= "TweenInfo" then
-		error("bad argument #2 to 'SetDirection' (TweenInfo expected, got " .. typeof(tweenInfo) .. ")", 2)
-	end
-	
-	if not (direction.unit.magnitude > 0) then -- intentional statement formatting since NaN comparison
-		warn("Attempt to set rain direction to a zero-length vector, falling back on default direction = (" .. tostring(RAIN_DEFAULT_DIRECTION) .. ")")
-		direction = RAIN_DEFAULT_DIRECTION
-	end
-	
-	if tweenInfo then
-		TweenService:Create(RainDirection, tweenInfo, {Value = direction}):Play()
-	else
-		RainDirection.Value = direction
-	end
-	
+local function newFallDrop()
+	local part = Instance.new("Part")
+	part.Shape = Enum.PartType.Cylinder
+	part.Anchored = true; part.CanCollide = false; part.CanTouch = false; part.CanQuery = false
+	part.CastShadow = false; part.Material = MAT; part.Color = COL; part.Transparency = CFG.FallTrans
+	part.Size = V3(1, 0.05, 0.05)
+	fallParts[#fallParts + 1] = part
+	return { part = part }
 end
 
-function Rain:SetCeiling(ceiling)
-	
-	if ceiling ~= nil and typeof(ceiling) ~= "number" then
-		error("bad argument #1 to 'SetCeiling' (number expected, got " .. typeof(ceiling) .. ")", 2)
+local function fallRaycast(origin, direction)
+	local unit = direction.Unit
+	for _ = 1, 3 do
+		local result = Workspace:Raycast(origin, direction, rp)
+		if not result then return nil end
+		local base = proxyOf[result.Instance] or result.Instance
+		if base.Transparency <= 0.9 and base.LocalTransparencyModifier <= 0.9 then return result end
+		local advance = (result.Position - origin).Magnitude + 0.05
+		if advance >= direction.Magnitude then return nil end
+		origin = origin + unit * advance
+		direction = unit * (direction.Magnitude - advance)
 	end
-	
-	currentCeiling = ceiling
-	
+	return nil
 end
 
-function Rain:SetStraightTexture(asset)
-	
-	if typeof(asset) ~= "string" then
-		error("bad argument #1 to 'SetStraightTexture' (string expected, got " .. typeof(asset) .. ")", 2)
+local function spawnFallDrop(aimPoint)
+	local target = aimPoint
+	if not target then
+		local nearZone = rng:NextNumber() < CFG.FallNearShare
+		local zoneRadius = nearZone and CFG.FallNearRadius or CFG.FallFarRadius
+		local angle = rand(0, 2 * pi)
+		local offsetDistance = zoneRadius * sqrt(rng:NextNumber())
+		local center = camPos + flatLook * (zoneRadius * (nearZone and 0.35 or 0.5))
+		target = V3(center.X + cos(angle) * offsetDistance, camPos.Y, center.Z + sin(angle) * offsetDistance)
 	end
-	
-	child(Emitter,"RainStraight").Texture = asset
-	
-	for _,v in pairs(rainAttachments) do
-		child(v,"RainStraight").Texture = asset
-	end
-	
+	-- every drop has its own size, hence its own terminal speed; horizontally it moves with the air, so bigger drops fall steeper in wind
+	local diameter = sampleDiameter()
+	local velocity = V3(W.X, -terminalSpeed(diameter) * VS * rand(0.97, 1.03), W.Z)
+	local speed = velocity.Magnitude
+	local direction = velocity / speed
+	local startHeight = CFG.RoofHeight
+	local origin = target - direction * startHeight
+	local travelLimit = startHeight + 60
+	local hit = fallRaycast(origin, direction * travelLimit)
+	local travel = hit and (hit.Position - origin).Magnitude or travelLimit
+	local cameraDistance = (target - camPos).Magnitude
+	local length = speed * CFG.Shutter * (1 + cameraDistance / 60) -- motion-blur streak = speed x exposure time
+	local width = CFG.FallWidth * (diameter / 2) * (1 + cameraDistance / 35)
+	local lifetime = (travel - length * 0.5) / speed
+	if lifetime <= 0.02 then return end
+
+	local fallDrop = table.remove(fallFree) or newFallDrop()
+	local part = fallDrop.part
+	local rotation = CFrame.fromMatrix(ZERO, direction, direction:Cross(Vector3.xAxis).Unit)
+	local birth = now - rand(0, dt)
+	part.Size = V3(length, width, width)
+	part.Transparency = 1 - (1 - CFG.FallTrans) * clamp(diameter / 2, 0.35, 2) -- a streak's brightness scales with the drop's diameter
+	part.CFrame = rotation + (origin + velocity * (now - birth))
+	part.Parent = rainF
+	fallDrop.origin = origin
+	fallDrop.velocity = velocity
+	fallDrop.rotation = rotation
+	fallDrop.birth = birth
+	fallDrop.lifetime = lifetime
+	local hitBase = hit and (proxyOf[hit.Instance] or hit.Instance)
+	fallDrop.onBody = hitBase ~= nil and isBodyPart(hitBase)
+	fallDrop.landing = not fallDrop.onBody and hit and hit.Material ~= Enum.Material.Water and hit.Normal.Y > 0.3 and hit.Position or nil
+	fallDrop.normal = fallDrop.landing and hit.Normal or nil
+	fallDrops[#fallDrops + 1] = fallDrop
 end
 
-function Rain:SetTopDownTexture(asset)
-	
-	if typeof(asset) ~= "string" then
-		error("bad argument #1 to 'SetStraightTexture' (string expected, got " .. typeof(asset) .. ")", 2)
-	end
-	
-	child(Emitter,"RainTopDown").Texture = asset
-	
-	for _,v in pairs(rainAttachments) do
-		child(v,"RainTopDown").Texture = asset
-	end
-	
+
+---------------------------------------------------------------- gui
+local function parentGui(g)
+	local ok = pcall(function() g.Parent = gethui and gethui() or plr:WaitForChild("PlayerGui") end)
+	if not ok then g.Parent = plr:WaitForChild("PlayerGui") end
+end
+---------------------------------------------------------------- spawn rays
+local function areaRay()
+	local R = CFG.AreaRadius
+	local a, r = rand(0, 2 * pi), R * sqrt(rng:NextNumber())
+	local c = camPos + flatLook * (R * 0.4)
+	local target = V3(c.X + cos(a) * r, camPos.Y, c.Z + sin(a) * r)
+	local H = CFG.RoofHeight
+	local vel = V3(W.X, -terminalSpeed(sampleDiameter()) * VS, W.Z)
+	local dir = vel.Unit
+	local res = ray(target - dir * H, dir * (H + 90))
+	if res and not isBodyPart(proxyOf[res.Instance] or res.Instance) then newDrop(res, 1) end
 end
 
-function Rain:SetSplashTexture(asset)
-	
-	if typeof(asset) ~= "string" then
-		error("bad argument #1 to 'SetStraightTexture' (string expected, got " .. typeof(asset) .. ")", 2)
-	end
-	
-	for _,v in pairs(splashAttachments) do
-		child(v,"RainSplash").Texture = asset
-	end
-	
-end
+---------------------------------------------------------------- main update
+local spawnAcc, nextCam = 0, 0
+local function update(delta)
+	dt = clamp(delta, 1 / 240, 0.1)
+	now = os.clock()
+	rays, splashN = 0, 0
+	cam = Workspace.CurrentCamera
+	if not cam then return end
+	local cf = cam.CFrame
+	camPos = cf.Position
+	local lk = cf.LookVector
+	flatLook = V3(lk.X, 0, lk.Z)
+	flatLook = flatLook.Magnitude > 0.01 and flatLook.Unit or ZERO
 
-function Rain:SetSoundId(asset)
-	
-	if typeof(asset) ~= "string" then
-		error("bad argument #1 to 'SetSoundId' (string expected, got " .. typeof(asset) .. ")", 2)
-	end
-	
-	Sound.SoundId = asset
-	
-end
+	-- quality governor
+	fpsAvg += (1 / dt - fpsAvg) * 0.04
+	if CFG.AutoQuality then
+		if fpsAvg < CFG.TargetFPS then q = max(0.3, q - dt * 0.15)
+		elseif fpsAvg > CFG.TargetFPS + 8 then q = min(1, q + dt * 0.05) end
+	else q = 1 end
+	rayCap = floor(40 * q) + 10
 
-function Rain:SetCollisionMode(mode, param)
-	
-	if mode == CollisionMode.None then
-		
-		-- Regular mode needs no white/blacklist or test function
-		collisionList = nil
-		collisionFunc = nil
-		
-	elseif mode == CollisionMode.Blacklist then
-		
-		if typeof(param) == "Instance" then
-			-- Add Emitter anyway, since users will probably not expect collisions with emitter block regardless
-			collisionList = {param, Emitter}
-		elseif typeof(param) == "table" then
-			for i = 1, #param do
-				if typeof(param[i]) ~= "Instance" then
-					error("bad argument #2 to 'SetCollisionMode' (blacklist contained a " .. typeof(param[i]) .. " on index " .. tostring(i) .. " which is not an Instance)", 2)
+	-- physics scales follow Workspace.Gravity / WorldScale / Intensity live
+	updatePhysics()
+	if GE ~= pGE or LS ~= pLS then pGE, pLS = GE, LS; syncSplash() end
+
+	-- wind: horizontal air velocity (m/s -> studs/s). Drops move with the air sideways and fall at their own terminal speed
+	if CFG.Wind then
+		local a = rad(CFG.WindDir)
+		local gust = 1 + CFG.Gustiness * math.noise(now * CFG.GustSpeed, 17.3) * 2
+		W = V3(sin(a), 0, cos(a)) * (CFG.WindStrength * max(gust, 0) * VS)
+	else W = ZERO end
+	local rainVel = V3(W.X, -terminalSpeed(meanD) * VS, W.Z) -- representative drop: used for roof checks and the density scaling
+	rainDir = rainVel.Unit
+	rainSpeed = rainVel.Magnitude
+
+	if filtersDirty then setFilters() end
+	if now >= nextChars then nextChars = now + 0.5; refreshChars() end
+	if now >= nextCam then nextCam = now + 0.25; camSh = sheltered(camPos) end
+	ap = max(CFG.AppearTime, 0.02)
+
+	-- spawn
+	if CFG.Enabled and not camSh then
+		local want = CFG.Rate * q * dt + spawnAcc
+		local n = floor(want)
+		spawnAcc = want - n
+		for _ = 1, min(n, 8) do
+			if rays >= rayCap then break end
+			areaRay()
+		end
+	else spawnAcc = 0 end
+
+	-- statics
+	for i = #S, 1, -1 do
+		local o = S[i]
+		local age = now - o.born
+		if age >= o.life then
+			vanish(o.p, V3(o.sz, o.sz * o.fl, o.sz)); rem(S, i)
+		else
+			if age < ap then
+				o.p.Size = V3(o.sz, o.sz * o.fl, o.sz) * (0.25 + 0.75 * age / ap)
+			elseif not o.full then
+				o.p.Size = V3(o.sz, o.sz * o.fl, o.sz); o.full = true
+			end
+			local h = o.host
+			if h then
+				if h.Parent == nil then
+					drop(o.p); rem(S, i)
+				else
+					local c = h.CFrame
+					if c ~= o.hcf then
+						local d = c * o.hcf:Inverse()
+						o.hcf = c; o.cf = d * o.cf
+						mv(o.p, o.cf)
+					end
 				end
 			end
-			collisionList = {Emitter} -- see above
-			for i = 1, #param do
-				table.insert(collisionList, param[i])
-			end
-		else
-			error("bad argument #2 to 'SetCollisionMode (Instance or array of Instance expected, got " .. typeof(param) .. ")'", 2)
 		end
-		
-		-- Blacklist does not need a test function
-		collisionFunc = nil
-		
-	elseif mode == CollisionMode.Whitelist then
-		
-		if typeof(param) == "Instance" then
-			collisionList = {param}
-		elseif typeof(param) == "table" then
-			for i = 1, #param do
-				if typeof(param[i]) ~= "Instance" then
-					error("bad argument #2 to 'SetCollisionMode' (whitelist contained a " .. typeof(param[i])  .. " on index " .. tostring(i) .. " which is not an Instance)", 2)
+	end
+
+	-- sliders
+	for i = #L, 1, -1 do
+		local s = L[i]
+		local status = 0
+		local h = s.host
+		if h then
+			if h.Parent == nil then
+				status = 1
+			else
+				local c = h.CFrame
+				if c ~= s.hcf then
+					local d = c * s.hcf:Inverse()
+					s.hcf = c
+					s.pos = d * s.pos; s.tail = d * s.tail
+					s.nrm = d:VectorToWorldSpace(s.nrm)
+					s.vel = d:VectorToWorldSpace(s.vel)
+					s.out = d:VectorToWorldSpace(s.out)
 				end
 			end
-			collisionList = {}
-			for i = 1, #param do
-				table.insert(collisionList, param[i])
+		end
+		if status == 0 then
+			if now - s.born > s.life then
+				status = 1
+			else
+				s.acc += dt
+				if s.acc >= s.nxt and rays < rayCap then
+					local hh = min(s.acc, 0.15)
+					s.acc = 0; s.nxt = rand(CFG.StepMin, CFG.StepMax)
+					status = stepSlider(s, hh)
+				end
 			end
-		else
-			error("bad argument #2 to 'SetCollisionMode (Instance or array of Instance expected, got " .. typeof(param) .. ")'", 2)
 		end
-		
-		-- Whitelist does not need a test function
-		collisionFunc = nil
-		
-	elseif mode == CollisionMode.Function then
-		
-		if typeof(param) ~= "function" then
-			error("bad argument #2 to 'SetCollisionMode' (function expected, got " .. typeof(param) .. ")", 2)
-		end
-		
-		-- Test function does not need a list
-		collisionList = nil
-		
-		collisionFunc = param
-		
-	else
-		error("bad argument #1 to 'SetCollisionMode (Rain.CollisionMode expected, got " .. typeof(param) .. ")'", 2)
+		if status == 1 then finishSlider(s); rem(L, i)
+		elseif status == 2 then rem(L, i)
+		else drawSlider(s) end
 	end
-	
-	collisionMode = mode
-	raycast = raycastFunctions[mode]
-	
+
+	-- trails
+	for i = #T, 1, -1 do
+		local t = T[i]
+		local age = now - t.born
+		if age >= t.life then
+			drop(t.p); rem(T, i)
+		else
+			local h = t.host
+			if h then
+				if h.Parent == nil then
+					drop(t.p); rem(T, i); continue
+				end
+				local c = h.CFrame
+				if c ~= t.hcf then
+					local d = c * t.hcf:Inverse()
+					t.hcf = c; t.cf = d * t.cf
+					mv(t.p, t.cf)
+				end
+			end
+			if now >= t.nu then
+				local f = age / t.life
+				local k = 1 - CFG.AgeTaper * f
+				t.p.Size = V3(t.len, t.th * k, t.sw * k)
+				t.p.Transparency = t.t0 + (1 - t.t0) * f * f * f
+				t.nu = now + t.life / 10
+			end
+		end
+	end
+
+	-- drips: ballistic under world gravity, with quadratic air drag toward each bead's own terminal speed (relative to the wind)
+	for i = #D, 1, -1 do
+		local d = D[i]
+		local h = min(dt, 0.05)
+		local vtE = d.vt * VS
+		local c = GE * (d.vel - W).Magnitude / (vtE * vtE)
+		local v = (d.vel + (V3(0, -GE, 0) + W * c) * h) / (1 + c * h)
+		local rel = v - W -- speed through the air can't overshoot terminal speed on a long frame (a bead dropped into a gust may start above it)
+		local relMax = max(vtE * 1.1, (d.vel - W).Magnitude)
+		local relMag = rel.Magnitude
+		if relMag > relMax then v = W + rel * (relMax / relMag) end
+		local spd = v.Magnitude
+		local step = v * h
+		local done = false
+		if now - d.born > 3.5 or d.pos.Y < camPos.Y - 160 then
+			done = true
+		else
+			local res = nil
+			if rays < rayCap + 25 then res = ray(d.pos, step + v.Unit * d.sz) end
+			if res then
+				if res.Material ~= Enum.Material.Water then
+					splash(res.Position, res.Normal, 2)
+					if CFG.Relanding then newDrop(res, 1.1) end
+				end
+				done = true
+			else
+				d.pos = d.pos + step; d.vel = v
+				local dirv = v / max(spd, 1e-3)
+				d.p.Size = V3(d.sz + spd * CFG.Shutter, d.sz * 0.9, d.sz * 0.9) -- motion blur grows with speed
+				mv(d.p, frame(d.pos, perp(dirv), dirv))
+			end
+		end
+		if done then drop(d.p); rem(D, i) end
+	end
+
+
+	-- vanishing
+	for i = #V, 1, -1 do
+		local v = V[i]
+		local k = 1 - (now - v.t0) / 0.18
+		if k <= 0 then drop(v.p); rem(V, i) else v.p.Size = v.sz * k end
+	end
+
+	if CFG.Enabled and not camSh then
+		local wantedDrops = CFG.FallRate * q * dt * (rainSpeed / REF_SPEED) + fallSpawnAccumulator
+		local spawnCount = floor(wantedDrops)
+		fallSpawnAccumulator = wantedDrops - spawnCount
+		for _ = 1, min(spawnCount, 100) do
+			if #fallDrops >= CFG.MaxFall then break end
+			spawnFallDrop()
+		end
+
+		if #chars > 0 then
+			local wantedBodyDrops = CFG.BodyRate * q * dt * min(#chars, 6) + bodyDropAccumulator
+			local bodySpawnCount = floor(wantedBodyDrops)
+			bodyDropAccumulator = wantedBodyDrops - bodySpawnCount
+			for _ = 1, min(bodySpawnCount, 60) do
+				if #fallDrops >= CFG.MaxFall then break end
+				local character = chars[rng:NextInteger(1, #chars)]
+				local cameraInsideLocal = character.loc and (camPos - character.r.Position).Magnitude < 2.2
+				if not character.sh and not cameraInsideLocal then
+					spawnFallDrop(character.r.Position + V3(rand(-1.7, 1.7), 0, rand(-1.7, 1.7)))
+				end
+			end
+		end
+	else
+		fallSpawnAccumulator = 0
+		bodyDropAccumulator = 0
+	end
+
+	for dropIndex = #fallDrops, 1, -1 do
+		local fallDrop = fallDrops[dropIndex]
+		local age = now - fallDrop.birth
+		if age >= fallDrop.lifetime then
+			if fallDrop.onBody then
+				local fallDirection = fallDrop.velocity.Unit
+				local currentPosition = fallDrop.origin + fallDrop.velocity * age
+				local bodyHit = fallRaycast(currentPosition - fallDirection * 1.2, fallDirection * 4)
+				if bodyHit and isBodyPart(proxyOf[bodyHit.Instance] or bodyHit.Instance)
+					and (bodyHit.Position - camPos).Magnitude > 2.2 then
+					newDrop(bodyHit, 1)
+				end
+			end
+			if fallDrop.landing and rng:NextNumber() < CFG.FallSplash then
+				splash(fallDrop.landing, fallDrop.normal, 1)
+			end
+			fallDrop.part.Parent = nil
+			fallFree[#fallFree + 1] = fallDrop
+			rem(fallDrops, dropIndex)
+		else
+			mv(fallDrop.part, fallDrop.rotation + (fallDrop.origin + fallDrop.velocity * age))
+		end
+	end
+
+	-- apply moves
+	if mvN > 0 then
+		Workspace:BulkMoveTo(mvP, mvC, Enum.BulkMoveMode.FireCFrameChanged)
+		table.clear(mvP); table.clear(mvC); mvN = 0
+	end
 end
 
-local ambientSounds = {
-	{ sound = ambientSound1, volume = ambientSound1.Volume },
-	{ sound = ambientSound2, volume = ambientSound2.Volume },
+local errd = false
+conns[#conns + 1] = RunService.RenderStepped:Connect(function(delta)
+	if not alive then return end
+	local ok, err = pcall(update, delta)
+	if not ok and not errd then errd = true; warn("RealRain:", err) end
+end)
+
+---------------------------------------------------------------- look / hooks
+local function applyLook()
+	MAT = Enum.Material[CFG.Material]
+	COL = COLORS[CFG.WaterColor] or COLORS[1]
+	for _, p in ipairs(beads) do
+		p.Material = MAT; p.Color = COL; p.CastShadow = CFG.CastShadow
+	end
+	for _, part in ipairs(fallParts) do
+		part.Material = MAT; part.Color = COL; part.Transparency = CFG.FallTrans
+	end
+end
+
+local ctrls = {}
+local HOOKS = {
+	Material = applyLook, WaterColor = applyLook, CastShadow = applyLook, FallTrans = applyLook,
+	PreciseMesh = function(v)
+		if v then nextScan = 0; for _, c in ipairs(chars) do scanChar(c.m) end end
+	end,
+}
+local function set(key, v)
+	CFG[key] = v
+	if key == "Enabled" then
+		_G.Rain = v == true
+		setScreenRainEnabled(v)
+	end
+	local h = HOOKS[key]
+	if h then h(v) end
+	local c = ctrls[key]
+	if c then c() end
+end
+local function preset(name)
+	local p = PRESETS[name]
+	if not p then return end
+	for k, v in pairs(p) do set(k, v) end
+end
+
+---------------------------------------------------------------- panel
+local UI = {
+	{ "GENERAL" },
+	{ "Enabled", "Rain Enabled", "bool" },
+	{ "Rate", "Rain Rate", 10, 400, 5 },
+	{ "MaxParts", "Max Parts", 200, 4000, 50 },
+	{ "Material", "Material", "choice", MATS },
+	{ "WaterColor", "Water Color", "color" },
+	{ "CastShadow", "Cast Shadow (LAGS!)", "bool" },
+	{ "AutoQuality", "Auto Quality", "bool" },
+	{ "TargetFPS", "Target FPS", 20, 60, 1 },
+	{ "PHYSICS" },
+	{ "WorldScale", "World Scale (studs/m)", 1, 20, 0.1 },
+	{ "Intensity", "Rain Intensity (mm/h)", 1, 150, 1 },
+	{ "Shutter", "Motion Blur (sec)", 0.005, 0.06, 0.005 },
+	{ "FALLING RAIN" },
+	{ "FallRate", "Fall Rate", 0, 5000, 50 },
+	{ "MaxFall", "Max Falling Drops", 200, 5000, 100 },
+	{ "FallWidth", "Drop Width", 0.02, 0.3, 0.01 },
+	{ "FallTrans", "Drop Transparency", 0, 1, 0.05 },
+	{ "FallSplash", "Impact Splash", 0, 0.5, 0.01 },
+	{ "FallNearRadius", "Near Radius", 8, 60, 1 },
+	{ "FallFarRadius", "Far Radius", 20, 120, 1 },
+	{ "FallNearShare", "Near Share", 0, 1, 0.05 },
+	{ "DROPLET" },
+	{ "DropSize", "Droplet Size (visual)", 0.02, 0.3, 0.01 },
+	{ "NominalDiameter", "Bead Diameter (mm)", 1, 6, 0.1 },
+	{ "SizeMin", "Size Min", 0.2, 1, 0.05 },
+	{ "SizeMax", "Size Max", 1, 3, 0.05 },
+	{ "TransMin", "Transparency Min", 0, 1, 0.05 },
+	{ "TransMax", "Transparency Max", 0, 1, 0.05 },
+	{ "Flatness", "Flatness", 0.1, 1, 0.05 },
+	{ "AppearTime", "Appear Time", 0.02, 0.5, 0.01 },
+	{ "SLIDING" },
+	{ "SlideChance", "Slide Chance", 0, 1, 0.05 },
+	{ "MaxSliders", "Max Sliders", 0, 300, 5 },
+	{ "Hysteresis", "Surface Stickiness", 0.25, 3, 0.05 },
+	{ "ContactFriction", "Slide Resistance (Pa.s)", 0.05, 1, 0.01 },
+	{ "FilmThickness", "Trail Film (um)", 2, 40, 1 },
+	{ "MinFlow", "Min Flow Speed", 0, 1, 0.05 },
+	{ "SlideStretch", "Slide Stretch", 0, 2, 0.05 },
+	{ "StaticLifeMin", "Static Life Min", 0.5, 10, 0.5 },
+	{ "StaticLifeMax", "Static Life Max", 0.5, 10, 0.5 },
+	{ "SliderLifeMin", "Slider Life Min", 0.5, 10, 0.5 },
+	{ "SliderLifeMax", "Slider Life Max", 0.5, 10, 0.5 },
+	{ "TRAILS" },
+	{ "Trails", "Trails Enabled", "bool" },
+	{ "StepMin", "Step Min", 0.02, 0.2, 0.005 },
+	{ "StepMax", "Step Max", 0.02, 0.3, 0.005 },
+	{ "WidthMin", "Width Min", 0.1, 1, 0.05 },
+	{ "WidthMax", "Width Max", 0.1, 1.5, 0.05 },
+	{ "AgeTaper", "Age Taper", 0, 1, 0.05 },
+	{ "TrailLifeMin", "Trail Life Min", 0.2, 6, 0.1 },
+	{ "TrailLifeMax", "Trail Life Max", 0.2, 6, 0.1 },
+	{ "DRIPS" },
+	{ "Drips", "Drips Enabled", "bool" },
+	{ "DetachAngle", "Detach Angle", -1, 0.5, 0.05 },
+	{ "Relanding", "Relanding", "bool" },
+	{ "AREA" },
+	{ "AreaRadius", "Radius", 8, 80, 1 },
+	{ "BodyRate", "Body Hit Rate", 0, 400, 5 },
+	{ "WIND" },
+	{ "Wind", "Wind Enabled", "bool" },
+	{ "WindDir", "Direction (deg)", 0, 360, 5 },
+	{ "WindStrength", "Speed (m/s)", 0, 30, 0.5 },
+	{ "Gustiness", "Gustiness", 0, 1, 0.05 },
+	{ "GustSpeed", "Gust Speed", 0.1, 3, 0.1 },
+	{ "SlideInfluence", "Surface Wind Exposure", 0, 1, 0.05 },
+	{ "REALISM" },
+	{ "Wobble", "Wobble", 0, 1, 0.05 },
+	{ "WobbleSpeed", "Wobble Speed", 0, 20, 1 },
+	{ "NormalSmoothing", "Normal Smoothing", 0, 0.9, 0.05 },
+	{ "SeamForgive", "Seam Forgive", 0, 0.5, 0.05 },
+	{ "SurfaceSnap", "Surface Snap", 0.05, 0.5, 0.01 },
+	{ "PRECISION" },
+	{ "PreciseMesh", "Precise Meshes (bodies)", "bool" },
+	{ "SHELTER" },
+	{ "Shelter", "Roof Blocks Rain", "bool" },
+	{ "RoofHeight", "Roof Check Height", 10, 200, 5 },
 }
 
-rainHooks.Enable = function(fadeTime)
-	Rain:Enable(TweenInfo.new(fadeTime))
-	for _, ambient in ipairs(ambientSounds) do
-		if not ambient.sound.Playing then
-			ambient.sound.Volume = 0
-			ambient.sound:Play()
-		end
-		TweenService:Create(ambient.sound, TweenInfo.new(fadeTime), { Volume = ambient.volume }):Play()
-	end
-end
+local panel, panelBtn, fpsLbl
+local function buildPanel()
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RealRainUI"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true; gui.DisplayOrder = 50
+	parentGui(gui)
+	panel = gui
 
-rainHooks.Disable = function(fadeTime)
-	Rain:Disable(TweenInfo.new(fadeTime))
-	for _, ambient in ipairs(ambientSounds) do
-		local fade = TweenService:Create(ambient.sound, TweenInfo.new(fadeTime), { Volume = 0 })
-		fade.Completed:Connect(function(state)
-			if state == Enum.PlaybackState.Completed then
-				ambient.sound:Stop()
+	local function corner(o, r) local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r); c.Parent = o end
+	local function label(parent, text, size, color, font)
+		local l = Instance.new("TextLabel")
+		l.BackgroundTransparency = 1; l.Text = text; l.TextSize = size; l.TextColor3 = color
+		l.Font = font or Enum.Font.Gotham; l.TextXAlignment = Enum.TextXAlignment.Left; l.Parent = parent
+		return l
+	end
+
+	local root = Instance.new("Frame")
+	root.AnchorPoint = Vector2.new(1, 0.5); root.Position = UDim2.new(1, -8, 0.5, 0); root.Size = UDim2.new(0, 300, 0.92, 0)
+	root.BackgroundColor3 = Color3.fromRGB(16, 18, 24); root.BorderSizePixel = 0; root.Parent = gui
+	corner(root, 8)
+	local rs = Instance.new("UIStroke"); rs.Color = Color3.fromRGB(45, 50, 62); rs.Parent = root
+
+	local title = label(root, "RAIN SETTINGS", 16, Color3.new(1, 1, 1), Enum.Font.GothamBold)
+	title.Position = UDim2.fromOffset(12, 6); title.Size = UDim2.fromOffset(150, 24)
+	fpsLbl = label(root, "60 FPS", 13, Color3.fromRGB(80, 220, 120), Enum.Font.GothamBold)
+	fpsLbl.Position = UDim2.new(1, -112, 0, 6); fpsLbl.Size = UDim2.fromOffset(70, 24); fpsLbl.TextXAlignment = Enum.TextXAlignment.Right
+	local x = Instance.new("TextButton")
+	x.Text = "X"; x.Font = Enum.Font.GothamBold; x.TextSize = 14; x.TextColor3 = Color3.fromRGB(200, 205, 215)
+	x.BackgroundColor3 = Color3.fromRGB(34, 38, 48); x.Size = UDim2.fromOffset(28, 24); x.Position = UDim2.new(1, -36, 0, 6)
+	x.AutoButtonColor = true; x.Parent = root; corner(x, 6)
+
+	local pr = Instance.new("Frame")
+	pr.BackgroundTransparency = 1; pr.Position = UDim2.fromOffset(8, 36); pr.Size = UDim2.new(1, -16, 0, 28); pr.Parent = root
+	local pl = Instance.new("UIListLayout"); pl.FillDirection = Enum.FillDirection.Horizontal; pl.Padding = UDim.new(0, 4); pl.Parent = pr
+	for _, nme in ipairs({ "LOW", "MEDIUM", "HIGH", "ULTRA" }) do
+		local b = Instance.new("TextButton")
+		b.Text = nme; b.Font = Enum.Font.GothamBold; b.TextSize = 12; b.TextColor3 = Color3.fromRGB(200, 205, 215)
+		b.BackgroundColor3 = Color3.fromRGB(34, 38, 48); b.Size = UDim2.new(0.25, -3, 1, 0); b.Parent = pr
+		corner(b, 6)
+		b.Activated:Connect(function() preset(nme) end)
+	end
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.BackgroundTransparency = 1; scroll.BorderSizePixel = 0
+	scroll.Position = UDim2.fromOffset(8, 70); scroll.Size = UDim2.new(1, -16, 1, -76)
+	scroll.ScrollBarThickness = 4; scroll.CanvasSize = UDim2.new(); scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	scroll.Parent = root
+	local ll = Instance.new("UIListLayout"); ll.Padding = UDim.new(0, 3); ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Parent = scroll
+
+	local activeSlider
+
+	local order = 0
+	for _, def in ipairs(UI) do
+		order += 1
+		if #def == 1 then
+			local h = label(scroll, def[1], 11, Color3.fromRGB(80, 160, 255), Enum.Font.GothamBold)
+			h.Size = UDim2.new(1, 0, 0, 20); h.LayoutOrder = order
+			h.Text = "  " .. def[1]
+		else
+			local key, name, kind = def[1], def[2], def[3]
+			local row = Instance.new("Frame")
+			row.Size = UDim2.new(1, -6, 0, 26); row.BackgroundColor3 = Color3.fromRGB(28, 31, 40); row.BorderSizePixel = 0
+			row.LayoutOrder = order; row.Parent = scroll; corner(row, 4)
+			local lb = label(row, name, 12, Color3.fromRGB(205, 210, 220))
+			lb.Position = UDim2.fromOffset(8, 0); lb.Size = UDim2.new(1, -160, 1, 0); lb.TextTruncate = Enum.TextTruncate.AtEnd
+
+			if kind == "bool" then
+				local b = Instance.new("TextButton")
+				b.Text = ""; b.AutoButtonColor = false; b.Size = UDim2.fromOffset(36, 16); b.AnchorPoint = Vector2.new(1, 0.5)
+				b.Position = UDim2.new(1, -8, 0.5, 0); b.Parent = row; corner(b, 8)
+				local kn = Instance.new("Frame")
+				kn.Size = UDim2.fromOffset(12, 12); kn.AnchorPoint = Vector2.new(0, 0.5); kn.BackgroundColor3 = Color3.new(1, 1, 1)
+				kn.BorderSizePixel = 0; kn.Parent = b; corner(kn, 6)
+				local function upd()
+					local on = CFG[key]
+					b.BackgroundColor3 = on and Color3.fromRGB(60, 200, 110) or Color3.fromRGB(60, 64, 76)
+					kn.Position = UDim2.new(0, on and 22 or 2, 0.5, 0)
+				end
+				ctrls[key] = upd; upd()
+				b.Activated:Connect(function() set(key, not CFG[key]) end)
+			elseif kind == "choice" then
+				local b = Instance.new("TextButton")
+				b.Font = Enum.Font.GothamBold; b.TextSize = 12; b.TextColor3 = Color3.new(1, 1, 1)
+				b.BackgroundColor3 = Color3.fromRGB(40, 44, 56); b.Size = UDim2.fromOffset(120, 20); b.AnchorPoint = Vector2.new(1, 0.5)
+				b.Position = UDim2.new(1, -6, 0.5, 0); b.Parent = row; corner(b, 4)
+				local opts = def[4]
+				local function upd() b.Text = tostring(CFG[key]) end
+				ctrls[key] = upd; upd()
+				b.Activated:Connect(function()
+					local idx = table.find(opts, CFG[key]) or 0
+					set(key, opts[idx % #opts + 1])
+				end)
+			elseif kind == "color" then
+				local btns = {}
+				for i, c in ipairs(COLORS) do
+					local b = Instance.new("TextButton")
+					b.Text = ""; b.AutoButtonColor = false; b.BackgroundColor3 = c; b.Size = UDim2.fromOffset(16, 16)
+					b.AnchorPoint = Vector2.new(1, 0.5); b.Position = UDim2.new(1, -8 - (#COLORS - i) * 21, 0.5, 0)
+					b.Parent = row; corner(b, 8)
+					local st = Instance.new("UIStroke"); st.Color = Color3.new(1, 1, 1); st.Thickness = 2; st.Parent = b
+					btns[i] = st
+					b.Activated:Connect(function() set(key, i) end)
+				end
+				local function upd() for i, st in ipairs(btns) do st.Enabled = (i == CFG[key]) end end
+				ctrls[key] = upd; upd()
+			else
+				local mn, mx, step = def[3], def[4], def[5]
+				local dec = step >= 1 and 0 or (step >= 0.1 and 1 or (step >= 0.01 and 2 or 3))
+				local vl = label(row, "", 11, Color3.fromRGB(90, 170, 255), Enum.Font.GothamBold)
+				vl.Size = UDim2.fromOffset(44, 26); vl.AnchorPoint = Vector2.new(1, 0); vl.Position = UDim2.new(1, -4, 0, 0)
+				vl.TextXAlignment = Enum.TextXAlignment.Right
+				local bar = Instance.new("TextButton")
+				bar.Text = ""; bar.AutoButtonColor = false; bar.BackgroundColor3 = Color3.fromRGB(46, 50, 62); bar.BorderSizePixel = 0
+				bar.Size = UDim2.fromOffset(96, 8); bar.AnchorPoint = Vector2.new(1, 0.5); bar.Position = UDim2.new(1, -52, 0.5, 0)
+				bar.Parent = row; corner(bar, 4)
+				local fill = Instance.new("Frame")
+				fill.BackgroundColor3 = Color3.fromRGB(60, 150, 255); fill.BorderSizePixel = 0; fill.Size = UDim2.fromScale(0, 1)
+				fill.Parent = bar; corner(fill, 4)
+				local function upd()
+					local v = CFG[key]
+					fill.Size = UDim2.fromScale(clamp((v - mn) / (mx - mn), 0, 1), 1)
+					vl.Text = string.format("%." .. dec .. "f", v)
+				end
+				ctrls[key] = upd; upd()
+				local function fromX(px)
+					local a = clamp((px - bar.AbsolutePosition.X) / max(bar.AbsoluteSize.X, 1), 0, 1)
+					local v = mn + a * (mx - mn)
+					v = floor(v / step + 0.5) * step
+					set(key, clamp(tonumber(string.format("%.4f", v)), mn, mx))
+				end
+				bar.InputBegan:Connect(function(i)
+					if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+						activeSlider = fromX
+						scroll.ScrollingEnabled = false
+						fromX(i.Position.X)
+					end
+				end)
 			end
-		end)
-		fade:Play()
+		end
 	end
-end
 
+	conns[#conns + 1] = UIS.InputChanged:Connect(function(i)
+		if activeSlider and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			activeSlider(i.Position.X)
+		end
+	end)
+	conns[#conns + 1] = UIS.InputEnded:Connect(function(i)
+		if activeSlider and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
+			activeSlider = nil
+			scroll.ScrollingEnabled = true
+		end
+	end)
+
+	panelBtn = Instance.new("TextButton")
+	panelBtn.Text = "RAIN"; panelBtn.Font = Enum.Font.GothamBold; panelBtn.TextSize = 11; panelBtn.TextColor3 = Color3.new(1, 1, 1)
+	panelBtn.BackgroundColor3 = Color3.fromRGB(16, 18, 24); panelBtn.BackgroundTransparency = 0.15
+	panelBtn.Size = UDim2.fromOffset(44, 30); panelBtn.Position = UDim2.new(0, 8, 0.5, -15); panelBtn.Visible = false
+	panelBtn.Parent = gui; corner(panelBtn, 6)
+
+	local function show(v) root.Visible = v; panelBtn.Visible = not v end
+	x.Activated:Connect(function() show(false) end)
+	panelBtn.Activated:Connect(function() show(true) end)
+	return show
+end
+local showPanel = buildPanel()
+
+task.spawn(function()
+	while alive do
+		task.wait(0.5)
+		if fpsLbl then
+			fpsLbl.Text = floor(fpsAvg + 0.5) .. " FPS"
+			fpsLbl.TextColor3 = fpsAvg >= 45 and Color3.fromRGB(80, 220, 120) or (fpsAvg >= 30 and Color3.fromRGB(240, 200, 70) or Color3.fromRGB(240, 90, 80))
+		end
+	end
 end)
 
-RainAPI:Enable()
+preset("HIGH")
+applyLook()
 
-return RainAPI
+---------------------------------------------------------------- API
+local api = {}
+api.Config = CFG
+api.Set = set
+api.Preset = preset
+api.Enable = function() set("Enabled", true) end
+api.Disable = function() set("Enabled", false) end
+api.Toggle = function() set("Enabled", not CFG.Enabled) end
+api.Panel = function(v) showPanel(v ~= false) end
+api.Destroy = function()
+	alive = false
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	for _, s in ipairs(splashes) do pcall(function() s.a:Destroy() end) end
+	for _, d in pairs({ rainF, proxyF, panel }) do pcall(function() d:Destroy() end) end
+	env.RealRain = nil
+end
+env.RealRain = api
+return api
