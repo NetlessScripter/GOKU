@@ -13,6 +13,15 @@ local RunService = game:GetService("RunService")
 local Player = Players.LocalPlayer
 local GameSettings = UserSettings().GameSettings
 
+-- altitude gate: the Y of our CFrame when the script starts is the "ground level" the cloud cutoff is measured from
+local BaseY = nil
+local AboveClouds = false
+do
+	local startChar = Player.Character
+	local startRoot = startChar and startChar:FindFirstChild("HumanoidRootPart")
+	if startRoot then BaseY = startRoot.CFrame.Position.Y end
+end
+
 local Camera = workspace.CurrentCamera
 while not Camera do
 	RunService.Heartbeat:Wait()
@@ -310,6 +319,7 @@ local CFG = {
 	Shelter = true, RoofHeight = 50,
 	Models = true, MaxModels = 8, ModelRadius = 45, ModelMaxSize = 30, ModelScanParts = 250, ModelRate = 60, MaxProxies = 120,
 	ShedChance = 0.6, ShedMaxNormal = 0.5, DripSplash = 5,
+	CloudHeight = 1650,
 }
 local PRESETS = {
 	LOW = { Rate = 45, MaxParts = 450, FallRate = 500, MaxFall = 600, MaxSliders = 20, MaxModels = 2, Trails = false, PreciseMesh = false },
@@ -1057,6 +1067,19 @@ local function update(delta)
 	rays, splashN = 0, 0
 	cam = Workspace.CurrentCamera
 	if not cam then return end
+
+	-- above the clouds (BaseY + CloudHeight): rain and screen droplets stop, they come back when we drop below again
+	local altChar = plr.Character
+	local altRoot = altChar and altChar:FindFirstChild("HumanoidRootPart")
+	if altRoot then
+		local y = altRoot.CFrame.Position.Y
+		if BaseY == nil then BaseY = y end
+		local above = y > BaseY + CFG.CloudHeight
+		if above ~= AboveClouds then
+			AboveClouds = above
+			setScreenRainEnabled(CFG.Enabled and not above)
+		end
+	end
 	local cf = cam.CFrame
 	camPos = cf.Position
 	local lk = cf.LookVector
@@ -1091,7 +1114,7 @@ local function update(delta)
 	ap = max(CFG.AppearTime, 0.02)
 
 	-- spawn
-	if CFG.Enabled and not camSh then
+	if CFG.Enabled and not AboveClouds and not camSh then
 		local want = CFG.Rate * q * dt + spawnAcc
 		local n = floor(want)
 		spawnAcc = want - n
@@ -1237,7 +1260,7 @@ local function update(delta)
 		if k <= 0 then drop(v.p); rem(V, i) else v.p.Size = v.sz * k end
 	end
 
-	if CFG.Enabled and not camSh then
+	if CFG.Enabled and not AboveClouds and not camSh then
 		local wantedDrops = CFG.FallRate * q * dt * (rainSpeed / REF_SPEED) + fallSpawnAccumulator
 		local spawnCount = floor(wantedDrops)
 		fallSpawnAccumulator = wantedDrops - spawnCount
@@ -1341,7 +1364,7 @@ local function set(key, v)
 	CFG[key] = v
 	if key == "Enabled" then
 		_G.Rain = v == true
-		setScreenRainEnabled(v)
+		setScreenRainEnabled(v and not AboveClouds)
 	end
 	local h = HOOKS[key]
 	if h then h(v) end
