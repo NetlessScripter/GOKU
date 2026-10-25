@@ -308,12 +308,14 @@ local CFG = {
 	Wobble = 0.2, WobbleSpeed = 8, NormalSmoothing = 0.3, SeamForgive = 0.15, SurfaceSnap = 0.15,
 	PreciseMesh = true,
 	Shelter = true, RoofHeight = 50,
+	Models = true, MaxModels = 8, ModelRadius = 45, ModelMaxSize = 30, ModelScanParts = 250, ModelRate = 60, MaxProxies = 120,
+	ShedChance = 0.6, ShedMaxNormal = 0.5, DripSplash = 5,
 }
 local PRESETS = {
-	LOW = { Rate = 45, MaxParts = 450, FallRate = 500, MaxFall = 600, MaxSliders = 20, Trails = false, PreciseMesh = false },
-	MEDIUM = { Rate = 75, MaxParts = 800, FallRate = 1000, MaxFall = 1200, MaxSliders = 45, Trails = true, PreciseMesh = true },
-	HIGH = { Rate = 110, MaxParts = 1400, FallRate = 1700, MaxFall = 1900, MaxSliders = 80, Trails = true, PreciseMesh = true },
-	ULTRA = { Rate = 170, MaxParts = 2400, FallRate = 2400, MaxFall = 2600, MaxSliders = 130, Trails = true, PreciseMesh = true },
+	LOW = { Rate = 45, MaxParts = 450, FallRate = 500, MaxFall = 600, MaxSliders = 20, MaxModels = 2, Trails = false, PreciseMesh = false },
+	MEDIUM = { Rate = 75, MaxParts = 800, FallRate = 1000, MaxFall = 1200, MaxSliders = 45, MaxModels = 5, Trails = true, PreciseMesh = true },
+	HIGH = { Rate = 110, MaxParts = 1400, FallRate = 1700, MaxFall = 1900, MaxSliders = 80, MaxModels = 8, Trails = true, PreciseMesh = true },
+	ULTRA = { Rate = 170, MaxParts = 2400, FallRate = 2400, MaxFall = 2600, MaxSliders = 130, MaxModels = 12, Trails = true, PreciseMesh = true },
 }
 local MATS = { "Glass", "Ice", "SmoothPlastic", "Plastic", "ForceField", "Neon" }
 local COLORS = {
@@ -495,11 +497,34 @@ for i = 1, 16 do
 	e.Parent = a
 	splashes[i] = { a = a, e = e }
 end
-local function splash(pos, n, cnt)
-	if splashN >= 6 or not CFG.Enabled then return end
+-- bigger crown splash for a drip that lands (the small pool above is for rain hitting the ground)
+local bigSplashes, bigSplashI = {}, 0
+for i = 1, 12 do
+	local a = Instance.new("Attachment"); a.Parent = Workspace.Terrain
+	local e = Instance.new("ParticleEmitter")
+	e.Enabled = false; e.Rate = 0
+	e.Lifetime = NumberRange.new(0.13, 0.31)
+	e.Speed = NumberRange.new(7, 17)
+	e.SpreadAngle = Vector2.new(70, 70)
+	e.Acceleration = V3(0, -100, 0)
+	e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.13), NumberSequenceKeypoint.new(1, 0.04) })
+	e.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1) })
+	e.Color = ColorSequence.new(Color3.fromRGB(225, 238, 250))
+	e.LightEmission = 0.2; e.LockedToPart = false
+	e.Parent = a
+	bigSplashes[i] = { a = a, e = e }
+end
+local function splash(pos, n, cnt, big)
+	if splashN >= (big and 12 or 6) or not CFG.Enabled then return end
 	splashN += 1
-	splashI = splashI % #splashes + 1
-	local s = splashes[splashI]
+	local s
+	if big then
+		bigSplashI = bigSplashI % #bigSplashes + 1
+		s = bigSplashes[bigSplashI]
+	else
+		splashI = splashI % #splashes + 1
+		s = splashes[splashI]
+	end
 	s.a.WorldCFrame = frame(pos + n * 0.02, n)
 	s.e:Emit(cnt or 2)
 end
@@ -512,11 +537,23 @@ local function syncSplash() -- ejected droplets are ballistic too: world gravity
 		s.e.Speed = NumberRange.new(0.6 * VS, 1.8 * VS)
 		s.e.Lifetime = NumberRange.new(flight * 0.5, flight * 1.5)
 	end
+	local bigFlight = 6 * VS / GE
+	for _, s in ipairs(bigSplashes) do
+		s.e.Acceleration = V3(0, -GE, 0)
+		s.e.Speed = NumberRange.new(0.8 * VS, 2 * VS)
+		s.e.Lifetime = NumberRange.new(bigFlight * 0.5, bigFlight * 1.2)
+	end
 end
 
 ---------------------------------------------------------------- droplets
-local newDrop, startDrip, isBodyPart
+local newDrop, startDrip, isBodyPart, isWetPart
 local ap = 0.12
+
+local function bodyModelOf(instance) -- the character / NPC model a part belongs to (nil for everything else)
+	local m = instance:FindFirstAncestorOfClass("Model")
+	if m and m:FindFirstChildOfClass("Humanoid") then return m end
+	return nil
+end
 
 function newDrop(res, sizeMul)
 	local inst, n, pos = res.Instance, res.Normal, res.Position
@@ -580,12 +617,13 @@ function newDrop(res, sizeMul)
 	}
 end
 
-function startDrip(pos, vel, sz, bead, Dm)
+function startDrip(pos, vel, sz, bead, Dm, hi)
 	if not CFG.Drips or #D >= 60 then
 		vanish(bead, bead.Size)
 		return
 	end
-	D[#D + 1] = { p = bead, pos = pos, vel = vel, sz = sz, born = now, vt = terminalSpeed((Dm or 0.003) * 1000) }
+	-- src: the body this bead left, so it can't land back on the body it fell off
+	D[#D + 1] = { p = bead, pos = pos, vel = vel, sz = sz, born = now, vt = terminalSpeed((Dm or 0.003) * 1000), src = hi and bodyModelOf(proxyOf[hi] or hi) or nil }
 end
 
 local function segCF(s, a, b)
@@ -622,6 +660,12 @@ end
 
 local function finishSlider(s)
 	stampTrail(s, false)
+	-- a tired bead on a wet body / model lets go and falls instead of just fading out
+	local n = s.nrm
+	if CFG.Drips and n.Y < CFG.ShedMaxNormal and rng:NextNumber() < CFG.ShedChance and isWetPart(proxyOf[s.hi] or s.hi) then
+		startDrip(s.pos + n * 0.02, ZERO, s.sz, s.p, s.Dm, s.hi)
+		return
+	end
 	vanish(s.p, s.p.Size)
 end
 
@@ -638,7 +682,7 @@ local function stepSlider(s, h)
 		local k = clamp((now - s.hang) / s.hangT, 0, 1)
 		s.fl = s.fl0 + (1.15 - s.fl0) * k * k
 		if k >= 1 then
-			startDrip(pos + n * 0.02, ZERO, s.sz, s.p, s.Dm)
+			startDrip(pos + n * 0.02, ZERO, s.sz, s.p, s.Dm, s.hi)
 			return 2
 		end
 		return 0
@@ -682,7 +726,7 @@ local function stepSlider(s, h)
 		if not res then
 			-- ran off an edge: the bead leaves with the speed it had
 			stampTrail(s, false)
-			startDrip(np + n * 0.01, v, s.sz, s.p, s.Dm)
+			startDrip(np + n * 0.01, v, s.sz, s.p, s.Dm, s.hi)
 			return 2
 		end
 	end
@@ -732,17 +776,19 @@ local function drawSlider(s)
 end
 
 ---------------------------------------------------------------- precise characters (accessories / special meshes)
-local queued, pq = {}, {}
-local function scanChar(m)
+local queued, pq, extraProxyList = {}, {}, {}
+local function scanChar(m, extra)
 	if not CFG.PreciseMesh then return end
-	for _, d in ipairs(m:GetDescendants()) do
+	local all = m:GetDescendants()
+	all[#all + 1] = m -- a loose MeshPart is its own target
+	for _, d in ipairs(all) do
 		if not queued[d] then
 			if d:IsA("MeshPart") and d.MeshId ~= "" then
 				queued[d] = true
-				pq[#pq + 1] = { part = d, id = d.MeshId }
+				pq[#pq + 1] = { part = d, id = d.MeshId, extra = extra }
 			elseif d:IsA("SpecialMesh") and d.MeshType == Enum.MeshType.FileMesh and d.MeshId ~= "" and d.Parent and d.Parent:IsA("BasePart") then
 				queued[d] = true
-				pq[#pq + 1] = { part = d.Parent, id = d.MeshId, sm = d }
+				pq[#pq + 1] = { part = d.Parent, id = d.MeshId, sm = d, extra = extra }
 			end
 		end
 	end
@@ -751,6 +797,7 @@ end
 local function makeProxy(job)
 	local orig = job.part
 	if not orig.Parent or not CFG.PreciseMesh then return end
+	if job.extra and #extraProxyList >= CFG.MaxProxies then queued[job.sm or orig] = nil; return end
 	local mp = AssetService:CreateMeshPartAsync(Content.fromUri(job.id), { CollisionFidelity = Enum.CollisionFidelity.PreciseConvexDecomposition })
 	if not alive or not orig:IsDescendantOf(Workspace) then mp:Destroy(); return end
 	local off = CFrame.identity
@@ -767,6 +814,7 @@ local function makeProxy(job)
 	local w = Instance.new("WeldConstraint"); w.Part0 = orig; w.Part1 = mp; w.Parent = mp
 	proxyOf[mp] = orig
 	excl[#excl + 1] = orig
+	if job.extra then extraProxyList[#extraProxyList + 1] = { mp = mp, orig = orig, key = job.sm or orig } end
 	filtersDirty = true
 	orig.Destroying:Connect(function()
 		proxyOf[mp] = nil
@@ -789,6 +837,80 @@ end)
 
 ---------------------------------------------------------------- characters / sheltered
 local chars, nextChars, nextScan = {}, 0, 0
+---------------------------------------------------------------- extra wet targets (models, NPCs, props, loose parts)
+local extras = {}
+local extraParams = OverlapParams.new()
+extraParams.FilterType = Enum.RaycastFilterType.Exclude
+extraParams.MaxParts = CFG.ModelScanParts
+local wetUnits = setmetatable({}, { __mode = "k" })    -- model / loose part -> os.clock() until which it counts as wet
+local unitSmall = setmetatable({}, { __mode = "k" })
+local unitScanned = setmetatable({}, { __mode = "k" })
+
+local function smallUnit(u) -- big models (the map, buildings) are left to the normal rain; only things up to ModelMaxSize studs get aimed rain
+	local small = unitSmall[u]
+	if small == nil then
+		local size = u:IsA("Model") and u:GetExtentsSize() or u.Size
+		small = size.Magnitude <= CFG.ModelMaxSize
+		unitSmall[u] = small
+	end
+	return small
+end
+
+local function pruneProxies() -- proxies made for models / props go away again once you've walked off
+	for i = #extraProxyList, 1, -1 do
+		local e = extraProxyList[i]
+		local gone = e.orig.Parent == nil
+		if gone or (e.orig.Position - camPos).Magnitude > CFG.ModelRadius * 2.5 then
+			if not gone then
+				proxyOf[e.mp] = nil
+				e.mp:Destroy()
+				for k = #excl, 1, -1 do
+					if excl[k] == e.orig then rem(excl, k) break end
+				end
+				queued[e.key] = nil
+				filtersDirty = true
+			end
+			rem(extraProxyList, i)
+		end
+	end
+end
+
+local function refreshExtras()
+	pruneProxies()
+	local list = {}
+	if CFG.Models and CFG.MaxModels > 0 then
+		local filter = { rainF, proxyF }
+		if cam then filter[#filter + 1] = cam end
+		for _, m in ipairs(models) do filter[#filter + 1] = m end -- player characters have their own targeting
+		extraParams.FilterDescendantsInstances = filter
+		extraParams.MaxParts = CFG.ModelScanParts
+		local found = Workspace:GetPartBoundsInRadius(camPos, CFG.ModelRadius, extraParams)
+		local count = #found
+		local start = count > 0 and rng:NextInteger(1, count) or 1
+		local picked = {}
+		for k = 0, count - 1 do
+			if #list >= CFG.MaxModels then break end
+			local p = found[(start + k - 1) % count + 1]
+			if p.CanQuery and p.Transparency < 0.8 and p.ClassName ~= "Terrain" then
+				local u = p:FindFirstAncestorOfClass("Model") or p
+				if not picked[u] and smallUnit(u) then
+					picked[u] = true
+					wetUnits[u] = now + 3
+					if not unitScanned[u] or now - unitScanned[u] > 10 then
+						unitScanned[u] = now
+						scanChar(u, true)
+					end
+					list[#list + 1] = {
+						p = p, ex = clamp(max(p.Size.X, p.Size.Z) * 0.5, 0.5, 3),
+						sh = sheltered(p.Position + V3(0, p.Size.Magnitude * 0.5 + 0.5, 0)),
+					}
+				end
+			end
+		end
+	end
+	extras = list
+end
+
 local function refreshChars()
 	local list, ms = {}, {}
 	for _, pl in ipairs(Players:GetPlayers()) do
@@ -810,12 +932,14 @@ local function refreshChars()
 		nextScan = now + 2
 		for i = 1, min(#list, 6) do scanChar(list[i].m) end
 	end
+	refreshExtras()
 end
 
 ---------------------------------------------------------------- falling drops
 local fallParts, fallFree, fallDrops = {}, {}, {}
 local fallSpawnAccumulator = 0
 local bodyDropAccumulator = 0
+local modelDropAccumulator = 0
 local bodyPartCache = setmetatable({}, { __mode = "k" })
 
 function isBodyPart(instance)
@@ -825,6 +949,18 @@ function isBodyPart(instance)
 	local result = model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
 	bodyPartCache[instance] = result
 	return result
+end
+
+local wetUnitCache = setmetatable({}, { __mode = "k" })
+function isWetPart(instance) -- a body, or a model / prop that is currently being wetted
+	if isBodyPart(instance) then return true end
+	local unit = wetUnitCache[instance]
+	if unit == nil then
+		unit = instance:FindFirstAncestorOfClass("Model") or instance
+		wetUnitCache[instance] = unit
+	end
+	local wetUntil = wetUnits[unit]
+	return wetUntil ~= nil and wetUntil > now
 end
 
 local function newFallDrop()
@@ -837,13 +973,14 @@ local function newFallDrop()
 	return { part = part }
 end
 
-local function fallRaycast(origin, direction)
+local function fallRaycast(origin, direction, ignoreModel) -- ignoreModel: a drip passes through the body it fell off
 	local unit = direction.Unit
-	for _ = 1, 3 do
+	for _ = 1, 6 do
 		local result = Workspace:Raycast(origin, direction, rp)
 		if not result then return nil end
 		local base = proxyOf[result.Instance] or result.Instance
-		if base.Transparency <= 0.9 and base.LocalTransparencyModifier <= 0.9 then return result end
+		if base.Transparency <= 0.9 and base.LocalTransparencyModifier <= 0.9
+			and not (ignoreModel and base:IsDescendantOf(ignoreModel)) then return result end
 		local advance = (result.Position - origin).Magnitude + 0.05
 		if advance >= direction.Magnitude then return nil end
 		origin = origin + unit * advance
@@ -892,7 +1029,7 @@ local function spawnFallDrop(aimPoint)
 	fallDrop.birth = birth
 	fallDrop.lifetime = lifetime
 	local hitBase = hit and (proxyOf[hit.Instance] or hit.Instance)
-	fallDrop.onBody = hitBase ~= nil and isBodyPart(hitBase)
+	fallDrop.onBody = hitBase ~= nil and isWetPart(hitBase)
 	fallDrop.landing = not fallDrop.onBody and hit and hit.Material ~= Enum.Material.Water and hit.Normal.Y > 0.3 and hit.Position or nil
 	fallDrop.normal = fallDrop.landing and hit.Normal or nil
 	fallDrops[#fallDrops + 1] = fallDrop
@@ -1075,11 +1212,10 @@ local function update(delta)
 		if now - d.born > 3.5 or d.pos.Y < camPos.Y - 160 then
 			done = true
 		else
-			local res = nil
-			if rays < rayCap + 25 then res = ray(d.pos, step + v.Unit * d.sz) end
+			local res = fallRaycast(d.pos, step + v.Unit * d.sz, d.src) -- every frame, no ray budget: a drip never tunnels through the ground
 			if res then
 				if res.Material ~= Enum.Material.Water then
-					splash(res.Position, res.Normal, 2)
+					splash(res.Position, res.Normal, CFG.DripSplash, true)
 					if CFG.Relanding then newDrop(res, 1.1) end
 				end
 				done = true
@@ -1123,9 +1259,26 @@ local function update(delta)
 				end
 			end
 		end
+
+		if #extras > 0 then
+			local wantedModelDrops = CFG.ModelRate * q * dt * min(#extras, 6) + modelDropAccumulator
+			local modelSpawnCount = floor(wantedModelDrops)
+			modelDropAccumulator = wantedModelDrops - modelSpawnCount
+			for _ = 1, min(modelSpawnCount, 40) do
+				if #fallDrops >= CFG.MaxFall then break end
+				local target = extras[rng:NextInteger(1, #extras)]
+				if target.p.Parent and not target.sh then
+					local c = target.p.Position
+					spawnFallDrop(V3(c.X + rand(-target.ex, target.ex), c.Y, c.Z + rand(-target.ex, target.ex)))
+				end
+			end
+		else
+			modelDropAccumulator = 0
+		end
 	else
 		fallSpawnAccumulator = 0
 		bodyDropAccumulator = 0
+		modelDropAccumulator = 0
 	end
 
 	for dropIndex = #fallDrops, 1, -1 do
@@ -1136,7 +1289,7 @@ local function update(delta)
 				local fallDirection = fallDrop.velocity.Unit
 				local currentPosition = fallDrop.origin + fallDrop.velocity * age
 				local bodyHit = fallRaycast(currentPosition - fallDirection * 1.2, fallDirection * 4)
-				if bodyHit and isBodyPart(proxyOf[bodyHit.Instance] or bodyHit.Instance)
+				if bodyHit and isWetPart(proxyOf[bodyHit.Instance] or bodyHit.Instance)
 					and (bodyHit.Position - camPos).Magnitude > 2.2 then
 					newDrop(bodyHit, 1)
 				end
@@ -1214,6 +1367,8 @@ api.Destroy = function()
 	alive = false
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	for _, s in ipairs(splashes) do pcall(function() s.a:Destroy() end) end
+	for _, s in ipairs(bigSplashes) do pcall(function() s.a:Destroy() end) end
+	for _, e in ipairs(extraProxyList) do pcall(function() e.mp:Destroy() end) end
 	for _, d in pairs({ rainF, proxyF }) do pcall(function() d:Destroy() end) end
 	pcall(function() ScreenDroplets:Destroy() end)
 	pcall(function() RunService:UnbindFromRenderStep("ScreenRainUpdate") end)
